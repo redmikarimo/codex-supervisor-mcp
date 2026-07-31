@@ -112,7 +112,6 @@ export class RelayQueue {
         reject(signal.reason ?? new Error("Claim wait aborted."));
       };
       const timer = setTimeout(() => finish(null), timeoutMs);
-      timer.unref?.();
       waiter.resolve = finish;
       signal?.addEventListener("abort", onAbort, { once: true });
       this.waiters.push(waiter);
@@ -152,7 +151,6 @@ export class RelayQueue {
           },
         });
       }, timeoutMs);
-      timer.unref?.();
       const onAbort = () => {
         cleanup();
         reject(signal.reason ?? new Error("Result wait aborted."));
