@@ -23,7 +23,7 @@ The server exposes these MCP tools:
 
 ## Requirements
 
-- Node.js 20 or newer.
+- Node.js 22 or newer.
 - A current Codex CLI available as `codex`.
 - Codex CLI authentication already configured.
 - One or more explicit local repository roots.
@@ -221,70 +221,19 @@ read scopes. The supervisor continues to restrict writable roots to the selected
 repository and validates every task directory against `CODEX_ALLOWED_ROOTS`.
 
 
-## Authenticated remote MCP relay
+## Hostinger remote relay
 
-Version 1.1.0 adds a Streamable HTTP-compatible endpoint so an internet-reachable MCP client can invoke the same supervisor tools.
-
-### Security model
-
-- Binds to `127.0.0.1` by default.
-- Requires bearer authentication by default.
-- Supports RS256 OAuth access tokens through an external issuer.
-- Continues enforcing `CODEX_ALLOWED_ROOTS`.
-- Keeps task networking disabled unless both server and call enable it.
-- Limits request bodies, request rate, and tool execution time.
-- Exposes an unauthenticated `/healthz` endpoint containing no repository data.
-
-Never expose `AUTH_MODE=none` to a network. Do not expose the port directly from a home router. Put the loopback listener behind an authenticated HTTPS tunnel or reverse proxy.
-
-### Start locally
-
-```powershell
-Set-Location -LiteralPath 'C:\Users\Red Mex\Documents\codex-supervisor-mcp'
-
-$env:CODEX_REMOTE_BEARER_TOKEN = 'GENERATE_A_LONG_RANDOM_SECRET'
-.\examples\start-remote.ps1
-```
-
-Verify locally:
-
-```powershell
-$Headers = @{
-  Authorization = "Bearer $env:CODEX_REMOTE_BEARER_TOKEN"
-  'Content-Type' = 'application/json'
-}
-
-$Body = @{
-  jsonrpc = '2.0'
-  id = 1
-  method = 'initialize'
-  params = @{
-    protocolVersion = '2025-11-25'
-    capabilities = @{}
-    clientInfo = @{ name = 'powershell-test'; version = '1.0.0' }
-  }
-} | ConvertTo-Json -Depth 10
-
-Invoke-RestMethod `
-  -Method Post `
-  -Uri 'http://127.0.0.1:8787/mcp' `
-  -Headers $Headers `
-  -Body $Body
-```
-
-### Publish through HTTPS
-
-A public MCP client cannot reach `localhost`. Use a managed tunnel or reverse proxy that maps a public HTTPS URL to `http://127.0.0.1:8787`. Keep the Node server bound to loopback.
-
-For ChatGPT Developer Mode, configure an OAuth issuer and set:
+Version 1.2.0 adds a Hostinger-compatible relay for ChatGPT remote MCP access:
 
 ```text
-CODEX_REMOTE_AUTH_MODE=oauth
-CODEX_REMOTE_OAUTH_ISSUER=https://YOUR_ISSUER
-CODEX_REMOTE_OAUTH_AUDIENCE=https://YOUR_PUBLIC_HOST/mcp
-CODEX_REMOTE_PUBLIC_URL=https://YOUR_PUBLIC_HOST
+ChatGPT -> OAuth bearer JWT -> Hostinger /mcp -> queued job -> outbound Windows local-agent -> Codex app-server
 ```
 
-Register the resulting `https://YOUR_PUBLIC_HOST/mcp` URL as a custom MCP connector. OAuth client registration and consent are handled by the selected identity provider.
+The public `/mcp` endpoint validates RS256 OAuth access tokens from an external
+identity provider. The Windows local-agent uses separate HMAC credentials only
+for outbound polling, status, lease acquisition, and result submission. The
+Hostinger relay never starts Codex and never reads local repositories.
 
-For the OpenAI Responses API, bearer mode can be passed as the remote MCP tool's authorization token.
+See [docs/REMOTE_DEPLOYMENT.md](docs/REMOTE_DEPLOYMENT.md) for Hostinger hPanel
+steps, DNS for `mcp.biotele.mx`, Auth0 setup, Microsoft Entra ID setup,
+environment variables, local-agent installation, and the threat model.

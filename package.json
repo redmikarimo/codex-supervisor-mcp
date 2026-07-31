@@ -1,20 +1,24 @@
 {
   "name": "codex-supervisor-mcp",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Local and authenticated remote MCP bridge for supervising Codex app-server threads.",
   "type": "module",
   "private": true,
   "bin": {
     "codex-supervisor-mcp": "./src/index.mjs",
-    "codex-supervisor-remote": "./src/remote-server.mjs"
+    "codex-supervisor-remote": "./src/remote-server.mjs",
+    "biotele-hostinger-relay": "./src/hostinger-relay.mjs",
+    "biotele-local-agent": "./src/local-agent.mjs"
   },
   "scripts": {
     "start": "node src/index.mjs",
     "test": "node --test test/*.test.mjs",
-    "start:remote": "node src/remote-server.mjs"
+    "start:remote": "node src/remote-server.mjs",
+    "start:hostinger-relay": "node src/hostinger-relay.mjs",
+    "start:local-agent": "node src/local-agent.mjs"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "license": "MIT"
 }

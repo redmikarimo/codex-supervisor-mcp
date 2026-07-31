@@ -90,7 +90,7 @@ if (-not $env:CODEX_REMOTE_AUTH_MODE) {
 }
 
 if ($env:CODEX_REMOTE_HOST -notin @('127.0.0.1', '::1')) {
-    throw 'CODEX_REMOTE_HOST must stay bound to loopback for Cloudflare Tunnel deployment.'
+    throw 'CODEX_REMOTE_HOST must stay bound to loopback. Use hostinger-relay plus local-agent for public deployment.'
 }
 if ($env:CODEX_REMOTE_AUTH_MODE -eq 'none') {
     throw 'CODEX_REMOTE_AUTH_MODE=none is not allowed for deployment startup.'
