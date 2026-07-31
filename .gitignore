@@ -2,4 +2,8 @@ node_modules/
 coverage/
 .DS_Store
 *.log
+npm-debug.log*
+.env
+.env.*
 desktop.ini
+Thumbs.db
