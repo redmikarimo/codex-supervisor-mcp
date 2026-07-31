@@ -1,0 +1,18 @@
+{
+  "name": "codex-supervisor-mcp",
+  "version": "1.0.3",
+  "description": "A local MCP bridge for starting, monitoring, steering, and approving Codex app-server threads.",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "codex-supervisor-mcp": "./src/index.mjs"
+  },
+  "scripts": {
+    "start": "node src/index.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

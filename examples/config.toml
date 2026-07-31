@@ -1,0 +1,15 @@
+# Merge this into ~/.codex/config.toml or a trusted project's .codex/config.toml.
+# Replace every example path with an absolute path on your machine.
+
+[mcp_servers.codex-supervisor]
+command = "node"
+args = ["/absolute/path/to/codex-supervisor-mcp/src/index.mjs"]
+startup_timeout_sec = 20
+tool_timeout_sec = 60
+default_tools_approval_mode = "writes"
+required = false
+
+[mcp_servers.codex-supervisor.env]
+CODEX_ALLOWED_ROOTS = "/absolute/path/to/repositories"
+CODEX_SUPERVISOR_MCP_NAME = "codex-supervisor"
+CODEX_ALLOW_NETWORK = "0"
