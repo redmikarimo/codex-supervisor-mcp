@@ -2,8 +2,29 @@ node_modules/
 coverage/
 .DS_Store
 *.log
+*.pem
+cert.pem
 npm-debug.log*
-.env
-.env.*
 desktop.ini
 Thumbs.db
+
+# Local environment and generated secrets.
+.env
+.env.*
+!.env.example
+!*.env.example
+.remote-bearer-token
+.remote-bearer-token.*
+remote-bearer-token*
+bearer-token*
+*.bearer-token
+.cloudflared-tunnel-token
+.cloudflared-tunnel-token.*
+
+# Cloudflare Tunnel local credentials. Keep examples and docs tracked.
+.cloudflared/
+**/.cloudflared/
+cloudflared/
+**/cloudflared/*.json
+*.cfargotunnel.json
+*.tunnel-credentials.json
