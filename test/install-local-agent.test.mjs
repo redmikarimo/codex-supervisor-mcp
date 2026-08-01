@@ -28,6 +28,10 @@ test("local-agent installer registers a least-privilege Windows task", async () 
   assert.match(installer, /CODEX_APP_SERVER_ARGS = \$appServerArgs/);
   assert.match(installer, /'CODEX_BIN',[\s\S]+?'CODEX_APP_SERVER_ARGS'/);
   assert.match(installer, /mcp_servers\.codex-supervisor\.enabled=false/);
+  assert.match(
+    installer,
+    /'mcp_servers\.codex-supervisor\.enabled=false'[\s\S]+?'-c'[\s\S]+?'approvals_reviewer="user"'[\s\S]+?'app-server'/,
+  );
   assert.match(installer, /PSBoundParameters\.ContainsKey\('AllowedRoots'\)/);
   assert.match(installer, /GetEnvironmentVariable\('CODEX_ALLOWED_ROOTS', 'User'\)/);
   assert.match(installer, /GetEnvironmentVariable\('BIOTELE_RELAY_AGENT_SECRET', 'User'\)/);

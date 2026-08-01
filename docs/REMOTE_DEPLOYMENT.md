@@ -183,9 +183,12 @@ npm install
 The installer reuses a valid stored HMAC secret or prompts without echoing it,
 discovers and persists the native `codex.exe`, preserves stored allowed roots
 when `-AllowedRoots` is omitted, and optionally registers a least-privilege
-logon scheduled task. It rejects `.cmd`, `.bat`, and `.ps1` Codex shims and does
-not execute an auto-discovered binary during installation. It does not put the
-secret in the task command. If Windows denies scheduled-task registration,
+logon scheduled task. Its dedicated app-server arguments set
+`approvals_reviewer="user"`, so approval requests remain available for explicit
+supervisor decisions instead of being routed to automatic review. It rejects
+`.cmd`, `.bat`, and `.ps1` Codex shims and does not execute an auto-discovered
+binary during installation. It does not put the secret in the task command. If
+Windows denies scheduled-task registration,
 rerun the installer from an Administrator PowerShell. The registered task still
 uses the `Limited` run level, is scoped to the current qualified Windows
 identity, runs without the default 72-hour execution cutoff, and is allowed to
