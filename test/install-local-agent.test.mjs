@@ -14,6 +14,7 @@ test("local-agent installer registers a least-privilege Windows task", async () 
   assert.match(installer, /-WindowStyle Hidden[^\r\n]+-EncodedCommand/);
   assert.match(installer, /New-ScheduledTaskSettingsSet[^\r\n]+-RestartCount 3[^\r\n]+-RestartInterval/);
   assert.match(installer, /Register-ScheduledTask[^\r\n]+-Settings \$settings/);
+  assert.match(installer, /Register-ScheduledTask[^\r\n]+-ErrorAction Stop/);
   assert.match(installer, /Scheduled task registration was denied/);
   assert.match(installer, /\[string\]\$CodexBin/);
   assert.match(installer, /Get-Command codex\.exe -CommandType Application/);
