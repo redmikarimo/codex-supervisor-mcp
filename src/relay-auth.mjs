@@ -33,7 +33,7 @@ function timingSafeStringEqual(left, right) {
 }
 
 function normalizeEnvText(value) {
-  return String(value)
+  const normalized = String(value)
     .trim()
     .replace(HTML_QUOTE_PATTERN, '"')
     .replace(HTML_APOSTROPHE_PATTERN, "'")
@@ -41,6 +41,10 @@ function normalizeEnvText(value) {
     .replace(QUOTE_PATTERN, "'")
     .replace(/\\"/g, '"')
     .replace(/\\'/g, "'");
+  if (normalized.startsWith("\\{") && normalized.endsWith("\\}")) {
+    return normalized.slice(1, -2) + "}";
+  }
+  return normalized;
 }
 
 function stripCredentialWrapper(value) {

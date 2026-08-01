@@ -12,7 +12,7 @@ const DOUBLE_QUOTE_PATTERN = /[\u201C\u201D\u201E\u201F\u2033]/g;
 const PLACEHOLDER_SECRET_PATTERN = /replace-with|placeholder|example/i;
 
 function normalizeEnvText(value) {
-  return String(value)
+  const normalized = String(value)
     .trim()
     .replace(HTML_QUOTE_PATTERN, '"')
     .replace(HTML_APOSTROPHE_PATTERN, "'")
@@ -20,6 +20,10 @@ function normalizeEnvText(value) {
     .replace(SINGLE_QUOTE_PATTERN, "'")
     .replace(/\\"/g, '"')
     .replace(/\\'/g, "'");
+  if (normalized.startsWith("\\{") && normalized.endsWith("\\}")) {
+    return normalized.slice(1, -2) + "}";
+  }
+  return normalized;
 }
 
 function stripCredentialWrapper(value) {

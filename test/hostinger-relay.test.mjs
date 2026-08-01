@@ -452,6 +452,21 @@ test("legacy Hostinger agent keys accept escaped quotes", async (t) => {
   assert.equal((await response.json()).status, "ok");
 });
 
+test("legacy Hostinger agent keys accept escaped JSON braces", async (t) => {
+  const { server, baseUrl } = await withRawRelay(t, {
+    env: {
+      ...validEnv(),
+      BIOTELE_RELAY_AGENT_KEYS: `\\{"windows-agent-1":"${AGENT_SECRET}"\\}`,
+    },
+    logger: { write() {} },
+  });
+  const readiness = await server.initialize();
+  assert.equal(readiness.status, "ready");
+  const response = await agentSignedPost(baseUrl, "/agent/status", {});
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).status, "ok");
+});
+
 test("legacy Hostinger agent keys accept HTML quote entities", async (t) => {
   const { server, baseUrl } = await withRawRelay(t, {
     env: {
