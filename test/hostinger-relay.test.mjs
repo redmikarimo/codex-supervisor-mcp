@@ -162,6 +162,14 @@ function validEnv({ agentSecret = AGENT_SECRET, issuer = "https://issuer.example
   };
 }
 
+function splitAgentEnv({ agentSecret = AGENT_SECRET, issuer = "https://issuer.example" } = {}) {
+  const env = validEnv({ agentSecret, issuer });
+  delete env.BIOTELE_RELAY_AGENT_KEYS;
+  env.BIOTELE_RELAY_AGENT_KEY_ID = AGENT_KEY_ID;
+  env.BIOTELE_RELAY_AGENT_SECRET = agentSecret;
+  return env;
+}
+
 async function oauthPost(baseUrl, path, bodyObject, token) {
   return await fetch(`${baseUrl}${path}`, {
     method: "POST",
@@ -315,6 +323,31 @@ test("startup and initialization error logs do not include secret values", async
   const output = logs.join("");
   assert.match(output, /Hostinger relay initialization failed/);
   assert.doesNotMatch(output, new RegExp(secret));
+});
+
+test("relay accepts split Hostinger agent credential environment variables", async (t) => {
+  const { server, baseUrl } = await withRawRelay(t, {
+    env: splitAgentEnv(),
+    logger: { write() {} },
+  });
+  const readiness = await server.initialize();
+  assert.equal(readiness.status, "ready");
+  const response = await agentSignedPost(baseUrl, "/agent/status", {});
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).status, "ok");
+});
+
+test("split agent credential environment variables must be paired", async (t) => {
+  const { server } = await withRawRelay(t, {
+    env: {
+      ...splitAgentEnv(),
+      BIOTELE_RELAY_AGENT_SECRET: "",
+    },
+    logger: { write() {} },
+  });
+  const readiness = await server.initialize();
+  assert.equal(readiness.status, "failed");
+  assert.match(readiness.error.message, /must be set together/);
 });
 
 test("relay rejects missing OAuth token and returns WWW-Authenticate metadata", async (t) => {

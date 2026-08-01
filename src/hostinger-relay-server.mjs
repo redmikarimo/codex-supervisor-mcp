@@ -40,6 +40,18 @@ function positiveIntegerFromEnv(env, name, defaultValue) {
   return value;
 }
 
+function agentCredentialsFromEnv(env) {
+  const keyId = env.BIOTELE_RELAY_AGENT_KEY_ID;
+  const secret = env.BIOTELE_RELAY_AGENT_SECRET;
+  if (keyId !== undefined || secret !== undefined) {
+    if (!keyId || !secret) {
+      throw new Error("BIOTELE_RELAY_AGENT_KEY_ID and BIOTELE_RELAY_AGENT_SECRET must be set together.");
+    }
+    return parseCredentialMap(`${keyId}:${secret}`, "BIOTELE_RELAY_AGENT_KEY_ID");
+  }
+  return parseCredentialMap(env.BIOTELE_RELAY_AGENT_KEYS, "BIOTELE_RELAY_AGENT_KEYS");
+}
+
 export function requiredPort(env = process.env) {
   if (env.PORT === undefined || String(env.PORT).trim() === "") {
     return 3000;
@@ -70,8 +82,7 @@ function buildRuntimeConfig({
   const oauthJwksCacheMs = positiveIntegerFromEnv(env, "BIOTELE_RELAY_OAUTH_JWKS_CACHE_MS", 600_000);
   const oauthClockSkewSeconds = positiveIntegerFromEnv(env, "BIOTELE_RELAY_OAUTH_CLOCK_SKEW_SECONDS", 60);
 
-  const agents =
-    agentCredentials ?? parseCredentialMap(env.BIOTELE_RELAY_AGENT_KEYS, "BIOTELE_RELAY_AGENT_KEYS");
+  const agents = agentCredentials ?? agentCredentialsFromEnv(env);
   const oauth =
     oauthResourceServer ??
     (oauthRequired

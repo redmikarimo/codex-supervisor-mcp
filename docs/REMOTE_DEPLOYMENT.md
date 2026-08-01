@@ -98,7 +98,8 @@ Use `examples/hostinger-relay.env.example` as a placeholder-only template.
 ```text
 NODE_ENV=production
 PORT=<provided by Hostinger, or 3000 if hPanel asks for one>
-BIOTELE_RELAY_AGENT_KEYS={"windows-agent-1":"<different 32+ byte agent secret>"}
+BIOTELE_RELAY_AGENT_KEY_ID=windows-agent-1
+BIOTELE_RELAY_AGENT_SECRET=<different 32+ byte agent secret>
 BIOTELE_RELAY_PUBLIC_URL=https://mcp.biotele.mx
 BIOTELE_RELAY_OAUTH_REQUIRED=true
 BIOTELE_RELAY_OAUTH_ISSUER=<issuer URL from Auth0 or Entra ID>
@@ -118,7 +119,9 @@ BIOTELE_RELAY_MAX_QUEUED_JOBS=200
 
 Do not set `BIOTELE_RELAY_CLIENT_KEYS` for ChatGPT. The public MCP endpoint
 uses OAuth bearer access tokens only. Agent HMAC credentials are separate and
-valid only on `/agent/jobs/claim` and `/agent/jobs/result`.
+valid only on `/agent/jobs/claim`, `/agent/jobs/result`, and `/agent/status`.
+Prefer the split `BIOTELE_RELAY_AGENT_KEY_ID` and `BIOTELE_RELAY_AGENT_SECRET`
+variables on Hostinger because some hPanel fields normalize JSON-shaped values.
 
 ## Local Agent Installation
 
