@@ -42,11 +42,11 @@ function positiveIntegerFromEnv(env, name, defaultValue) {
 
 export function requiredPort(env = process.env) {
   if (env.PORT === undefined || String(env.PORT).trim() === "") {
-    throw new Error("PORT is required and must be an integer from 0 to 65535.");
+    return 3000;
   }
   const value = Number(env.PORT);
   if (!Number.isInteger(value) || value < 0 || value > 65_535) {
-    throw new Error("PORT is required and must be an integer from 0 to 65535.");
+    throw new Error("PORT must be an integer from 0 to 65535 when provided.");
   }
   return value;
 }

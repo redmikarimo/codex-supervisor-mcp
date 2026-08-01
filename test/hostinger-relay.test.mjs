@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   createHostingerRelayServer,
   requiredPort,
+  startHostingerRelay,
 } from "../src/hostinger-relay-server.mjs";
 import { OAuthResourceServer } from "../src/oauth-resource-server.mjs";
 import { signRequest } from "../src/relay-auth.mjs";
@@ -267,12 +268,32 @@ test("initialization failure never enables unauthenticated access", async (t) =>
   assert.equal(mcp.status, 503);
 });
 
-test("PORT is required and validated", () => {
-  assert.throws(() => requiredPort({}), /PORT is required/);
-  assert.throws(() => requiredPort({ PORT: "" }), /PORT is required/);
-  assert.throws(() => requiredPort({ PORT: "abc" }), /PORT is required/);
-  assert.throws(() => requiredPort({ PORT: "70000" }), /PORT is required/);
+test("PORT defaults to 3000 when absent or blank", () => {
+  assert.equal(requiredPort({}), 3000);
+  assert.equal(requiredPort({ PORT: "" }), 3000);
+  assert.equal(requiredPort({ PORT: "   " }), 3000);
+});
+
+test("valid PORT is honored and invalid PORT is rejected", () => {
   assert.equal(requiredPort({ PORT: "3000" }), 3000);
+  assert.equal(requiredPort({ PORT: "0" }), 0);
+  assert.equal(requiredPort({ PORT: "65535" }), 65_535);
+  assert.throws(() => requiredPort({ PORT: "abc" }), /PORT must be an integer/);
+  assert.throws(() => requiredPort({ PORT: "-1" }), /PORT must be an integer/);
+  assert.throws(() => requiredPort({ PORT: "70000" }), /PORT must be an integer/);
+});
+
+test("startHostingerRelay calls listen immediately with resolved port", async (t) => {
+  const logs = [];
+  const server = startHostingerRelay({
+    env: validEnv({ issuer: "" }),
+    logger: { write: (line) => logs.push(line) },
+    hostname: "127.0.0.1",
+  });
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  await new Promise((resolve) => server.once("listening", resolve));
+  assert.ok(server.address().port > 0);
+  assert.match(logs.join(""), /Hostinger relay listening on port 0/);
 });
 
 test("startup and initialization error logs do not include secret values", async (t) => {
