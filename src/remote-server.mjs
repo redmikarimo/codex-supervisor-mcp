@@ -9,7 +9,7 @@ import { AppServerError } from "./errors.mjs";
 import { CodexSupervisorService } from "./supervisor-service.mjs";
 import { createToolRegistry } from "./tool-registry.mjs";
 
-const VERSION = "1.2.4";
+const VERSION = "1.2.5";
 const DEFAULT_PROTOCOL_VERSION = "2025-11-25";
 const SUPPORTED_PROTOCOL_VERSIONS = new Set([DEFAULT_PROTOCOL_VERSION]);
 const MAX_BODY_BYTES = Number.parseInt(process.env.CODEX_REMOTE_MAX_BODY_BYTES ?? "1048576", 10);

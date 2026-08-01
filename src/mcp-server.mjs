@@ -5,7 +5,7 @@ import { AppServerError, SecurityError, ValidationError } from "./errors.mjs";
 
 const SERVER_NAME = "codex-supervisor-mcp";
 const SERVER_TITLE = "Codex Supervisor MCP";
-const SERVER_VERSION = "1.2.4";
+const SERVER_VERSION = "1.2.5";
 const MODERN_PROTOCOL_VERSION = "2026-07-28";
 const LATEST_LEGACY_PROTOCOL_VERSION = "2025-11-25";
 const LEGACY_PROTOCOL_VERSIONS = new Set([LATEST_LEGACY_PROTOCOL_VERSION]);

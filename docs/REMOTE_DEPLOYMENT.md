@@ -516,7 +516,7 @@ Run the full test suite before deployment:
 npm test
 ```
 
-For v1.2.4, deploy and verify the Hostinger relay first. Then run the Windows
+For v1.2.5, deploy and verify the Hostinger relay first. Then run the Windows
 installer and restart the scheduled task. This order is rollback-safe because
 the new relay accepts both result formats and the new agent uses chunking only
 when the relay advertises it.

@@ -242,7 +242,7 @@ repository and validates every task directory against `CODEX_ALLOWED_ROOTS`.
 
 ## Hostinger remote relay
 
-Version 1.2.4 provides a Hostinger-compatible relay for ChatGPT remote MCP access:
+Version 1.2.5 provides a Hostinger-compatible relay for ChatGPT remote MCP access:
 
 ```text
 ChatGPT -> OAuth bearer JWT -> Hostinger /mcp -> queued job -> outbound Windows local-agent -> Codex app-server
@@ -260,6 +260,11 @@ id, and request hash; terminating a session invalidates its cached or pending
 work. The release also cleans up cancelled relay work and crashed app-server
 state, revalidates authorized paths, isolates per-thread events, and redacts
 bounded nested error data at every public transport.
+
+Version 1.2.5 also reconciles `codex_status.latestAgentMessage` with the
+authorized persisted transcript. Fully persisted external Codex completions,
+including synthesized `rollout-*` turns, now replace stale bridge-observed
+messages while incomplete or interrupted transcript tails remain excluded.
 
 Deploy the updated relay before updating the Windows agent. The new relay still
 accepts legacy one-shot results, while the new agent uses the chunked format
