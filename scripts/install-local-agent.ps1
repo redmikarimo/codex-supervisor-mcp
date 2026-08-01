@@ -40,8 +40,30 @@ Write-Host 'Secret values were not printed.'
 
 if ($RegisterScheduledTask) {
   $escapedProjectPath = $ProjectPath.Replace("'", "''")
-  $command = "Set-Location -LiteralPath '$escapedProjectPath'; npm run start:local-agent"
-  $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -Command `"$command`""
+  $agentPath = (Join-Path $ProjectPath 'src\local-agent.mjs').Replace("'", "''")
+  $nodePath = (Get-Command node.exe -ErrorAction Stop).Source.Replace("'", "''")
+  $startupScript = @"
+`$ErrorActionPreference = 'Stop'
+`$requiredEnvironment = @(
+  'BIOTELE_RELAY_BASE_URL',
+  'BIOTELE_RELAY_AGENT_KEY_ID',
+  'BIOTELE_RELAY_AGENT_SECRET',
+  'CODEX_ALLOWED_ROOTS',
+  'CODEX_ALLOW_NETWORK'
+)
+foreach (`$name in `$requiredEnvironment) {
+  `$value = [Environment]::GetEnvironmentVariable(`$name, 'User')
+  if ([string]::IsNullOrWhiteSpace(`$value)) {
+    throw "Required user environment variable is missing: `$name"
+  }
+  [Environment]::SetEnvironmentVariable(`$name, `$value, 'Process')
+}
+Set-Location -LiteralPath '$escapedProjectPath'
+& '$nodePath' '$agentPath'
+exit `$LASTEXITCODE
+"@
+  $encodedStartup = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($startupScript))
+  $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -EncodedCommand $encodedStartup" -WorkingDirectory $ProjectPath
   $trigger = New-ScheduledTaskTrigger -AtLogOn
   $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
   try {
