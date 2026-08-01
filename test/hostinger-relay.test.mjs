@@ -3,7 +3,10 @@ import { generateKeyPairSync, sign as signJwtInput } from "node:crypto";
 import http from "node:http";
 import test from "node:test";
 
-import { createHostingerRelayServer } from "../src/hostinger-relay.mjs";
+import {
+  createHostingerRelayServer,
+  requiredPort,
+} from "../src/hostinger-relay-server.mjs";
 import { OAuthResourceServer } from "../src/oauth-resource-server.mjs";
 import { signRequest } from "../src/relay-auth.mjs";
 import { RelayQueue } from "../src/relay-queue.mjs";
@@ -112,17 +115,50 @@ async function withRelay(t, {
     queue,
     agentCredentials: new Map([[AGENT_KEY_ID, AGENT_SECRET]]),
     publicUrl: "https://mcp.biotele.mx",
+    logger: { write() {} },
     oauthResourceServer: new OAuthResourceServer({
       issuer,
       audience: AUDIENCE,
       jwksCacheMs: 60_000,
       clockSkewSeconds: 0,
     }),
+    autoInitialize: false,
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const readiness = await server.initialize();
+  assert.equal(readiness.status, "ready");
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const { port } = server.address();
+  return `http://127.0.0.1:${port}`;
+}
+
+async function withRawRelay(t, options = {}) {
+  const server = createHostingerRelayServer({
+    autoInitialize: false,
+    ...options,
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   t.after(() => new Promise((resolve) => server.close(resolve)));
   const { port } = server.address();
-  return `http://127.0.0.1:${port}`;
+  return {
+    server,
+    baseUrl: `http://127.0.0.1:${port}`,
+  };
+}
+
+function validEnv({ agentSecret = AGENT_SECRET, issuer = "https://issuer.example" } = {}) {
+  return {
+    PORT: "0",
+    BIOTELE_RELAY_PUBLIC_URL: "https://mcp.biotele.mx",
+    BIOTELE_RELAY_OAUTH_REQUIRED: "true",
+    BIOTELE_RELAY_OAUTH_ISSUER: issuer,
+    BIOTELE_RELAY_OAUTH_AUDIENCE: AUDIENCE,
+    BIOTELE_RELAY_OAUTH_READ_SCOPE: READ_SCOPE,
+    BIOTELE_RELAY_OAUTH_WRITE_SCOPE: WRITE_SCOPE,
+    BIOTELE_RELAY_AGENT_KEYS: JSON.stringify({
+      [AGENT_KEY_ID]: agentSecret,
+    }),
+  };
 }
 
 async function oauthPost(baseUrl, path, bodyObject, token) {
@@ -155,6 +191,105 @@ async function agentSignedPost(baseUrl, path, bodyObject, overrides = {}) {
     body,
   });
 }
+
+test("relay listen path does not wait for initialization or OAuth discovery", async (t) => {
+  const { server, baseUrl } = await withRawRelay(t, {
+    env: validEnv(),
+    logger: { write() {} },
+    initializeDelayMs: 100,
+  });
+  const initializePromise = server.initialize();
+  const response = await fetch(`${baseUrl}/readyz`);
+  assert.equal(response.status, 503);
+  assert.deepEqual(await response.json(), { status: "initializing" });
+  const readiness = await initializePromise;
+  assert.equal(readiness.status, "ready");
+});
+
+test("/readyz returns 200 after initialization", async (t) => {
+  const { server, baseUrl } = await withRawRelay(t, {
+    env: validEnv(),
+    logger: { write() {} },
+  });
+  await server.initialize();
+  const response = await fetch(`${baseUrl}/readyz`);
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { status: "ready" });
+});
+
+test("/mcp fails closed while initializing", async (t) => {
+  const { server, baseUrl } = await withRawRelay(t, {
+    env: validEnv(),
+    logger: { write() {} },
+    initializeDelayMs: 100,
+  });
+  const initializePromise = server.initialize();
+  const response = await fetch(`${baseUrl}/mcp`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+  });
+  assert.equal(response.status, 503);
+  assert.equal((await response.json()).status, "initializing");
+  await initializePromise;
+});
+
+test("agent routes fail closed while initializing", async (t) => {
+  const { server, baseUrl } = await withRawRelay(t, {
+    env: validEnv(),
+    logger: { write() {} },
+    initializeDelayMs: 100,
+  });
+  const initializePromise = server.initialize();
+  const response = await agentSignedPost(baseUrl, "/agent/status", {});
+  assert.equal(response.status, 503);
+  assert.equal((await response.json()).status, "initializing");
+  await initializePromise;
+});
+
+test("initialization failure never enables unauthenticated access", async (t) => {
+  const { server, baseUrl } = await withRawRelay(t, {
+    env: {
+      ...validEnv(),
+      BIOTELE_RELAY_OAUTH_ISSUER: "",
+    },
+    logger: { write() {} },
+  });
+  const readiness = await server.initialize();
+  assert.equal(readiness.status, "failed");
+  const readyz = await fetch(`${baseUrl}/readyz`);
+  assert.equal(readyz.status, 503);
+  const mcp = await fetch(`${baseUrl}/mcp`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+  });
+  assert.equal(mcp.status, 503);
+});
+
+test("PORT is required and validated", () => {
+  assert.throws(() => requiredPort({}), /PORT is required/);
+  assert.throws(() => requiredPort({ PORT: "" }), /PORT is required/);
+  assert.throws(() => requiredPort({ PORT: "abc" }), /PORT is required/);
+  assert.throws(() => requiredPort({ PORT: "70000" }), /PORT is required/);
+  assert.equal(requiredPort({ PORT: "3000" }), 3000);
+});
+
+test("startup and initialization error logs do not include secret values", async (t) => {
+  const logs = [];
+  const secret = "this-secret-must-not-appear-0123456789";
+  const { server } = await withRawRelay(t, {
+    env: {
+      ...validEnv({ agentSecret: secret }),
+      BIOTELE_RELAY_OAUTH_ISSUER: "",
+    },
+    logger: { write: (line) => logs.push(line) },
+  });
+  await server.initialize();
+  const output = logs.join("");
+  assert.match(output, /Hostinger relay initialization failed/);
+  assert.doesNotMatch(output, new RegExp(secret));
+});
 
 test("relay rejects missing OAuth token and returns WWW-Authenticate metadata", async (t) => {
   const key = createRsaKey("kid-1");
