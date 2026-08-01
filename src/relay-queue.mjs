@@ -14,6 +14,10 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
+function abortReason(signal, message) {
+  return signal?.reason ?? Object.assign(new Error(message), { name: "AbortError" });
+}
+
 export class RelayQueue {
   constructor({
     jobTtlMs = 2 * 60_000,
@@ -105,6 +109,9 @@ export class RelayQueue {
   }
 
   async waitForClaimable({ timeoutMs = 25_000, signal = undefined, leaseOwner = undefined } = {}) {
+    if (signal?.aborted) {
+      throw abortReason(signal, "Claim wait aborted.");
+    }
     const immediate = this.claim({ leaseOwner });
     if (immediate) {
       return immediate;
@@ -126,7 +133,7 @@ export class RelayQueue {
       };
       const onAbort = () => {
         cleanup();
-        reject(signal.reason ?? new Error("Claim wait aborted."));
+        reject(abortReason(signal, "Claim wait aborted."));
       };
       const timer = setTimeout(() => finish(null), timeoutMs);
       waiter.resolve = finish;
@@ -165,6 +172,17 @@ export class RelayQueue {
   }
 
   async waitForResult(job, { timeoutMs, signal = undefined } = {}) {
+    this.#reap();
+    if (this.jobs.get(job.id) !== job) {
+      return await job.completion.promise;
+    }
+    if (signal?.aborted) {
+      const reason = abortReason(signal, "Result wait aborted.");
+      if (this.#cancel(job, "RelayCancelled", "The MCP client disconnected before the job completed.")) {
+        throw reason;
+      }
+      return await job.completion.promise;
+    }
     job.resultDeadlineAt = Math.min(job.resultDeadlineAt, this.now() + timeoutMs);
     return await new Promise((resolve, reject) => {
       const cleanup = () => {
@@ -172,17 +190,18 @@ export class RelayQueue {
         signal?.removeEventListener("abort", onAbort);
       };
       const timer = setTimeout(() => {
-        this.jobs.delete(job.id);
-        job.completion.resolve({
-          error: {
-            type: "RelayTimeout",
-            message: "Timed out waiting for the local agent to finish the job.",
-          },
-        });
+        this.#cancel(
+          job,
+          "RelayTimeout",
+          "Timed out waiting for the local agent to finish the job.",
+        );
       }, timeoutMs);
       const onAbort = () => {
-        cleanup();
-        reject(signal.reason ?? new Error("Result wait aborted."));
+        const reason = abortReason(signal, "Result wait aborted.");
+        if (this.#cancel(job, "RelayCancelled", "The MCP client disconnected before the job completed.")) {
+          cleanup();
+          reject(reason);
+        }
       };
       signal?.addEventListener("abort", onAbort, { once: true });
       job.completion.promise.then(
@@ -222,6 +241,20 @@ export class RelayQueue {
         return;
       }
     }
+  }
+
+  #cancel(job, type, message) {
+    if (this.jobs.get(job.id) !== job) {
+      return false;
+    }
+    this.jobs.delete(job.id);
+    job.completion.resolve({
+      error: {
+        type,
+        message,
+      },
+    });
+    return true;
   }
 
   #reap() {

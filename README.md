@@ -19,7 +19,7 @@ The server exposes these MCP tools:
 | `codex_list_threads` | List persisted threads inside configured roots. |
 | `codex_read_thread` | Read a persisted authorized thread. |
 | `codex_list_approvals` | Inspect pending app-server requests. |
-| `codex_resolve_approval` | Accept or reject command-execution and file-change approvals. |
+| `codex_resolve_approval` | Accept, decline, or cancel command-execution and file-change approvals. |
 
 ## Requirements
 
@@ -128,6 +128,11 @@ events.
 (default) and `untrusted`. The legacy values `onRequest` and `unlessTrusted`
 are accepted by the bridge and normalized before the app-server request.
 
+The public approval API accepts `decline` even when a Codex app-server release
+advertises only `cancel` for the request. In that case the bridge uses the safe
+app-server cancellation response and reports both the requested and effective
+decisions.
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -163,6 +168,12 @@ equivalent disable override yourself.
 - Command and file-change approvals must be resolved explicitly.
 - Threads outside allowed roots are denied or filtered.
 - Event payloads are size-bounded before storage.
+- Stored thread paths are re-canonicalized at use time; deleted or replaced
+  repository paths fail closed.
+- Same-thread mutations, approval responses, and retried remote calls are
+  serialized or deduplicated rather than executed twice.
+- Transport errors are recursively redacted and size-bounded before they cross
+  STDIO or HTTP boundaries.
 - Relay and remote-server credentials (`BIOTELE_*` and `CODEX_REMOTE_*`) are
   removed from the child Codex environment.
 - Remote result submissions are HMAC-authenticated, base64url encoded, split
@@ -231,7 +242,7 @@ repository and validates every task directory against `CODEX_ALLOWED_ROOTS`.
 
 ## Hostinger remote relay
 
-Version 1.2.3 provides a Hostinger-compatible relay for ChatGPT remote MCP access:
+Version 1.2.4 provides a Hostinger-compatible relay for ChatGPT remote MCP access:
 
 ```text
 ChatGPT -> OAuth bearer JWT -> Hostinger /mcp -> queued job -> outbound Windows local-agent -> Codex app-server
@@ -242,10 +253,19 @@ identity provider. The Windows local-agent uses separate HMAC credentials only
 for outbound polling, status, lease acquisition, and result submission. The
 Hostinger relay never starts Codex and never reads local repositories.
 
+This release also negotiates a supported MCP protocol version, issues a bounded
+OAuth-subject-bound session, and requires that session on follow-up requests.
+Retried tool calls are bound to the OAuth subject, MCP session, typed JSON-RPC
+id, and request hash; terminating a session invalidates its cached or pending
+work. The release also cleans up cancelled relay work and crashed app-server
+state, revalidates authorized paths, isolates per-thread events, and redacts
+bounded nested error data at every public transport.
+
 Deploy the updated relay before updating the Windows agent. The new relay still
 accepts legacy one-shot results, while the new agent uses the chunked format
 only after the relay advertises support.
 
 See [docs/REMOTE_DEPLOYMENT.md](docs/REMOTE_DEPLOYMENT.md) for Hostinger hPanel
 steps, DNS for `mcp.biotele.mx`, Auth0 setup, Microsoft Entra ID setup,
-environment variables, local-agent installation, and the threat model.
+ChatGPT web connector setup and recovery, environment variables, local-agent
+installation, and the threat model.

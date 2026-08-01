@@ -100,20 +100,38 @@ export class PathPolicy {
       return false;
     }
 
-    const resolved = path.resolve(rawPath);
-    const canonical = await realPathOrNull(resolved);
-    if (canonical !== null) {
-      return this.allowedRoots.some((root) => isInside(root, canonical));
+    try {
+      await this.resolveStoredPath(rawPath);
+      return true;
+    } catch (error) {
+      if (error instanceof SecurityError || error instanceof ValidationError) {
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  async resolveStoredPath(rawPath, { mustExist = false } = {}) {
+    if (typeof rawPath !== "string" || rawPath.trim() === "") {
+      throw new ValidationError("Stored cwd must be a non-empty path.");
     }
 
-    return this.allowedRoots.some((root) => isInside(root, resolved));
+    const resolved = path.resolve(rawPath);
+    const canonical = await realPathOrNull(resolved);
+    if (canonical === null) {
+      if (mustExist) {
+        throw new ValidationError(`Stored cwd does not exist: ${resolved}`);
+      }
+      this.assertAllowedCanonical(resolved);
+      return resolved;
+    }
+
+    await assertDirectory(canonical, "Stored cwd");
+    this.assertAllowedCanonical(canonical);
+    return canonical;
   }
 
   async assertAllowedStoredPath(rawPath) {
-    if (!(await this.isAllowedStoredPath(rawPath))) {
-      throw new SecurityError(
-        `The Codex thread belongs to a directory outside CODEX_ALLOWED_ROOTS: ${String(rawPath)}`,
-      );
-    }
+    return await this.resolveStoredPath(rawPath);
   }
 }

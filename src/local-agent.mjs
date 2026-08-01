@@ -5,10 +5,11 @@ import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 
 import { AppServerError } from "./errors.mjs";
+import { sanitizeErrorData, sanitizeErrorText } from "./error-sanitization.mjs";
 import { PathPolicy } from "./security.mjs";
 import { CodexSupervisorService } from "./supervisor-service.mjs";
 import { createToolRegistry } from "./tool-registry.mjs";
-import { signedFetch } from "./relay-auth.mjs";
+import { canonicalPath, signRequest } from "./relay-auth.mjs";
 import {
   DEFAULT_MAX_RESULT_BYTES,
   DEFAULT_RESULT_CHUNK_BYTES,
@@ -19,7 +20,7 @@ import {
   encodeResultSubmission,
 } from "./relay-result-protocol.mjs";
 
-const VERSION = "1.2.3";
+const VERSION = "1.2.4";
 const BASE_URL = (process.env.BIOTELE_RELAY_BASE_URL ?? "https://mcp.biotele.mx").replace(/\/+$/, "");
 const AGENT_KEY_ID = process.env.BIOTELE_RELAY_AGENT_KEY_ID ?? "";
 const AGENT_SECRET = process.env.BIOTELE_RELAY_AGENT_SECRET ?? "";
@@ -74,10 +75,7 @@ function assertStartupConfig() {
 }
 
 function redactError(error) {
-  const message = String(error?.message ?? error);
-  return message
-    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [REDACTED]")
-    .replace(/(token|secret|key|password)=([^&\s]+)/gi, "$1=[REDACTED]");
+  return sanitizeErrorText(error?.message ?? error);
 }
 
 function completeToolResult(output, isError = false) {
@@ -97,13 +95,19 @@ function errorToolResult(error) {
   return completeToolResult(
     {
       error: {
-        type: error?.name ?? "Error",
-        message: redactError(error),
+        type: sanitizeErrorText(error?.name ?? "Error", 128),
+        message: sanitizeErrorText(error?.message ?? error),
         ...(error instanceof AppServerError
           ? {
-              code: error.code ?? null,
-              method: error.method ?? null,
-              data: error.data ?? null,
+              code:
+                error.code === undefined || error.code === null
+                  ? null
+                  : sanitizeErrorText(error.code, 128),
+              method:
+                error.method === undefined || error.method === null
+                  ? null
+                  : sanitizeErrorText(error.method, 256),
+              data: sanitizeErrorData(error.data ?? null),
             }
           : {}),
       },
@@ -225,15 +229,45 @@ export async function parseRelayResponse(response, path) {
   return payload;
 }
 
-async function requestRelay(path, bodyObject, timeoutMs = REQUEST_TIMEOUT_MS) {
-  const response = await signedFetch(`${BASE_URL}${path}`, {
+async function requestRelay(
+  path,
+  bodyObject,
+  timeoutMs = REQUEST_TIMEOUT_MS,
+  { signal = undefined } = {},
+) {
+  const target = new URL(`${BASE_URL}${path}`);
+  const body = JSON.stringify(bodyObject);
+  const signature = signRequest({
     method: "POST",
-    bodyObject,
+    path: canonicalPath(target),
+    body,
     keyId: AGENT_KEY_ID,
     secret: AGENT_SECRET,
-    timeoutMs,
   });
-  return await parseRelayResponse(response, path);
+  const controller = new AbortController();
+  const onAbort = () => controller.abort(signal.reason);
+  if (signal?.aborted) {
+    onAbort();
+  } else {
+    signal?.addEventListener("abort", onAbort, { once: true });
+  }
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  timer.unref?.();
+  try {
+    const response = await fetch(target, {
+      method: "POST",
+      body,
+      headers: {
+        ...signature.headers,
+        "content-type": "application/json",
+      },
+      signal: controller.signal,
+    });
+    return await parseRelayResponse(response, path);
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", onAbort);
+  }
 }
 
 function positiveAdvertisedInteger(value, fallback) {
@@ -438,45 +472,96 @@ export class LocalRelayAgent {
     pathPolicy,
     completed = new CompletedJobCache({ ttlMs: COMPLETED_CACHE_MS }),
     submit = submitResult,
+    request = requestRelay,
+    sleepFn = (delay, { signal } = {}) => sleep(delay, undefined, { signal }),
   }) {
     this.service = service;
     this.tools = tools;
     this.pathPolicy = pathPolicy;
     this.completed = completed;
     this.submit = submit;
+    this.request = request;
+    this.sleepFn = sleepFn;
     this.stopping = false;
     this.inFlight = new Set();
+    this.activeJobs = new Set();
+    this.pollController = new AbortController();
+    this.runPromise = null;
+    this.stopPromise = null;
   }
 
-  async run() {
+  run() {
+    this.runPromise ??= this.#run();
+    return this.runPromise;
+  }
+
+  async #run() {
     process.stderr.write(`Biotele local agent v${VERSION} polling ${BASE_URL}\n`);
     let backoffMs = 1_000;
     while (!this.stopping) {
       try {
-        const payload = await requestRelay(
+        const payload = await this.request(
           "/agent/jobs/claim",
           { maxWaitMs: POLL_WAIT_MS },
           POLL_WAIT_MS + REQUEST_TIMEOUT_MS,
+          { signal: this.pollController.signal },
         );
+        if (this.stopping) {
+          break;
+        }
         backoffMs = 1_000;
         if (!payload?.job) {
           continue;
         }
         await this.handleJob(payload.job, payload.resultSubmission);
       } catch (error) {
+        if (this.stopping && this.pollController.signal.aborted) {
+          break;
+        }
         process.stderr.write(`[local-agent] ${redactError(error)}\n`);
-        await sleep(backoffMs);
+        try {
+          await this.sleepFn(backoffMs, { signal: this.pollController.signal });
+        } catch (sleepError) {
+          if (this.stopping && this.pollController.signal.aborted) {
+            break;
+          }
+          throw sleepError;
+        }
         backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF_MS);
       }
     }
   }
 
-  async stop() {
+  stop() {
+    if (this.stopPromise) {
+      return this.stopPromise;
+    }
     this.stopping = true;
-    await this.service.close?.();
+    this.pollController.abort(
+      Object.assign(new Error("Local relay agent is stopping."), { name: "AbortError" }),
+    );
+    this.stopPromise = (async () => {
+      try {
+        if (this.runPromise) {
+          await this.runPromise;
+        }
+      } finally {
+        await Promise.allSettled([...this.activeJobs]);
+        await this.service.close?.();
+      }
+    })();
+    return this.stopPromise;
   }
 
-  async handleJob(job, resultSubmission) {
+  handleJob(job, resultSubmission) {
+    const task = this.#handleJob(job, resultSubmission);
+    this.activeJobs.add(task);
+    const remove = () => this.activeJobs.delete(task);
+    void task.then(remove, remove);
+    return task;
+  }
+
+  async #handleJob(job, resultSubmission) {
     job = anchorResultBudget(job);
     const cached = this.completed.get(job.id);
     if (cached) {
@@ -562,12 +647,24 @@ export async function createLocalRelayAgent() {
 
 export async function main() {
   const agent = await createLocalRelayAgent();
-  const shutdown = async () => {
-    await agent.stop();
+  let shutdownPromise = null;
+  const shutdown = () => {
+    shutdownPromise ??= agent.stop();
+    return shutdownPromise;
   };
-  process.once("SIGINT", () => void shutdown());
-  process.once("SIGTERM", () => void shutdown());
-  await agent.run();
+  const onSignal = () => {
+    void shutdown().catch((error) => {
+      process.stderr.write(`${redactError(error)}\n`);
+      process.exitCode = 1;
+    });
+  };
+  process.once("SIGINT", onSignal);
+  process.once("SIGTERM", onSignal);
+  try {
+    await agent.run();
+  } finally {
+    await shutdown();
+  }
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {

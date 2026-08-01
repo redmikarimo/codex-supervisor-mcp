@@ -98,6 +98,39 @@ export class EventStore {
     this.activeTurns.set(threadId, turn.id);
   }
 
+  recordProcessFailure(error) {
+    const affectedTurns = new Map(this.activeTurns);
+    for (const request of this.pendingRequests.values()) {
+      if (request.threadId && !affectedTurns.has(request.threadId)) {
+        affectedTurns.set(request.threadId, request.turnId ?? null);
+      }
+    }
+
+    this.pendingRequests.clear();
+    this.activeTurns.clear();
+    this.turnThreads.clear();
+
+    const failure = {
+      type: error?.name ?? "AppServerError",
+      message: error?.message ?? String(error),
+      source: "app-server-process",
+    };
+    for (const [threadId, turnId] of affectedTurns) {
+      this.threadStatuses.set(threadId, { type: "error" });
+      this.record(
+        "error",
+        {
+          threadId,
+          ...(turnId ? { turnId } : {}),
+          error: failure,
+        },
+        { kind: "lifecycle" },
+      );
+    }
+
+    return affectedTurns.size;
+  }
+
   record(method, params = {}, { kind = "notification", requestId = undefined } = {}) {
     const turnId = extractTurnId(params);
     let threadId = extractThreadId(params, this.turnThreads);
@@ -220,7 +253,7 @@ export class EventStore {
     const matching = this.events.filter(
       (event) =>
         event.sequence > afterSequence &&
-        (event.threadId === threadId || event.threadId === null),
+        event.threadId === threadId,
     );
     return matching.length > maxEvents ? matching.slice(-maxEvents) : matching;
   }
@@ -311,7 +344,7 @@ export class EventStore {
     for (const waiter of [...this.waiters]) {
       if (
         event.sequence > waiter.afterSequence &&
-        (event.threadId === waiter.threadId || event.threadId === null)
+        event.threadId === waiter.threadId
       ) {
         waiter.resolve(
           event.kind === "server_request"

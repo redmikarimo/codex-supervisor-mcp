@@ -1,6 +1,7 @@
 import http from "node:http";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
+import { sanitizeErrorData, sanitizeErrorText } from "./error-sanitization.mjs";
 import { TOOL_DEFINITIONS } from "./tool-registry.mjs";
 import {
   NonceStore,
@@ -18,13 +19,16 @@ import {
   resultSubmissionCapabilities,
 } from "./relay-result-protocol.mjs";
 
-const VERSION = "1.2.3";
+const VERSION = "1.2.4";
 const DEFAULT_PROTOCOL_VERSION = "2025-11-25";
+const SUPPORTED_PROTOCOL_VERSIONS = new Set([DEFAULT_PROTOCOL_VERSION]);
 const DEFAULT_PUBLIC_URL = "https://mcp.biotele.mx";
 const DEFAULT_READ_SCOPE = "biotele.mcp.read";
 const DEFAULT_WRITE_SCOPE = "biotele.mcp.write";
 const DEFAULT_AGENT_KEY_ID = "windows-agent-1";
+const DEFAULT_MCP_SESSION_TTL_MS = 24 * 60 * 60_000;
 const BASE64_SECRET_PATTERN = /^[A-Za-z0-9+/]+={0,2}$/;
+const MCP_SESSION_PATTERN = /^[\x21-\x7e]{1,128}$/;
 
 const READ_TOOLS = new Set([
   "codex_status",
@@ -173,6 +177,17 @@ function buildRuntimeConfig({
     maxResultBytes,
     chunkBytes: resultChunkBytes,
   });
+  const idempotency = new ToolCallIdempotency({
+    ttlMs: jobTtlMs,
+    maxEntries: maxQueuedJobs,
+  });
+  const sessions = new McpSessionRegistry({
+    ttlMs: DEFAULT_MCP_SESSION_TTL_MS,
+    maxEntries: Math.min(10_000, Math.max(100, maxQueuedJobs * 10)),
+    onInvalidate: ({ subject, sessionId, message }) => {
+      idempotency.invalidateSession({ subject, sessionId, message });
+    },
+  });
 
   return {
     publicUrl: resolvedPublicUrl,
@@ -186,6 +201,8 @@ function buildRuntimeConfig({
     readScope: env.BIOTELE_RELAY_OAUTH_READ_SCOPE ?? DEFAULT_READ_SCOPE,
     writeScope: env.BIOTELE_RELAY_OAUTH_WRITE_SCOPE ?? DEFAULT_WRITE_SCOPE,
     queue: resolvedQueue,
+    idempotency,
+    sessions,
     resultSubmission,
     resultAssembler: new ResultSubmissionAssembler({
       maxResultBytes,
@@ -213,21 +230,22 @@ function rpcError(id, code, message, data = undefined) {
     id: id ?? null,
     error: {
       code,
-      message,
-      ...(data === undefined ? {} : { data }),
+      message: sanitizeErrorText(message),
+      ...(data === undefined ? {} : { data: sanitizeErrorData(data) }),
     },
   };
 }
 
 function toolErrorResult(error) {
+  const safeError = sanitizeErrorData(error);
   return {
     content: [
       {
         type: "text",
-        text: JSON.stringify({ error }, null, 2),
+        text: JSON.stringify({ error: safeError }, null, 2),
       },
     ],
-    structuredContent: { error },
+    structuredContent: { error: safeError },
     isError: true,
   };
 }
@@ -289,6 +307,315 @@ class RateLimiter {
   }
 }
 
+function canonicalJson(value) {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => canonicalJson(entry)).join(",")}]`;
+  }
+  return `{${Object.keys(value)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+    .join(",")}}`;
+}
+
+function toolCallHash(message) {
+  return createHash("sha256")
+    .update(canonicalJson({
+      jsonrpc: message.jsonrpc,
+      method: message.method,
+      params: message.params ?? null,
+    }))
+    .digest("base64url");
+}
+
+function typedRpcId(id) {
+  return canonicalJson([id === null ? "null" : typeof id, id]);
+}
+
+function negotiateProtocolVersion(requested) {
+  return SUPPORTED_PROTOCOL_VERSIONS.has(requested)
+    ? requested
+    : DEFAULT_PROTOCOL_VERSION;
+}
+
+function sessionError(statusCode, code, message) {
+  return Object.assign(new Error(message), { statusCode, code });
+}
+
+function requestSessionId(req) {
+  const header = req.headers["mcp-session-id"];
+  if (header === undefined) {
+    throw sessionError(
+      400,
+      "mcp_session_required",
+      "Mcp-Session-Id is required after initialize.",
+    );
+  }
+  if (Array.isArray(header) || !MCP_SESSION_PATTERN.test(header)) {
+    throw sessionError(
+      400,
+      "invalid_mcp_session",
+      "Mcp-Session-Id must be one visible ASCII value of at most 128 characters.",
+    );
+  }
+  return header;
+}
+
+class McpSessionRegistry {
+  constructor({ ttlMs, maxEntries, now = () => Date.now(), onInvalidate = () => {} }) {
+    this.ttlMs = ttlMs;
+    this.maxEntries = maxEntries;
+    this.now = now;
+    this.onInvalidate = onInvalidate;
+    this.entries = new Map();
+  }
+
+  issue(subject) {
+    this.#reap();
+    if (this.entries.size >= this.maxEntries) {
+      throw sessionError(503, "mcp_session_capacity", "MCP session capacity is exhausted.");
+    }
+    let sessionId;
+    do {
+      sessionId = randomUUID();
+    } while (this.entries.has(sessionId));
+    this.entries.set(sessionId, {
+      subject,
+      expiresAt: this.now() + this.ttlMs,
+    });
+    return sessionId;
+  }
+
+  require(req, subject) {
+    this.#reap();
+    const sessionId = requestSessionId(req);
+    const entry = this.entries.get(sessionId);
+    if (!entry || entry.subject !== subject) {
+      throw sessionError(404, "mcp_session_not_found", "MCP session was not found.");
+    }
+    entry.expiresAt = this.now() + this.ttlMs;
+    return sessionId;
+  }
+
+  terminate(req, subject, message = "MCP session terminated by the client.") {
+    const sessionId = this.require(req, subject);
+    this.#remove(sessionId, message);
+    return sessionId;
+  }
+
+  shutdown(message = "Relay is shutting down.") {
+    for (const sessionId of [...this.entries.keys()]) {
+      this.#remove(sessionId, message);
+    }
+  }
+
+  #remove(sessionId, message) {
+    const entry = this.entries.get(sessionId);
+    if (!entry) {
+      return false;
+    }
+    this.entries.delete(sessionId);
+    this.onInvalidate({ subject: entry.subject, sessionId, message });
+    return true;
+  }
+
+  #reap() {
+    const now = this.now();
+    for (const [sessionId, entry] of this.entries) {
+      if (entry.expiresAt <= now) {
+        this.#remove(sessionId, "MCP session expired.");
+      }
+    }
+  }
+}
+
+function disconnectSignal(req, res) {
+  const controller = new AbortController();
+  const reason = Object.assign(new Error("MCP client disconnected."), {
+    name: "AbortError",
+  });
+  const abort = () => {
+    if (!controller.signal.aborted) {
+      controller.abort(reason);
+    }
+  };
+  const onResponseClose = () => {
+    if (!res.writableEnded) {
+      abort();
+    }
+  };
+  req.once("aborted", abort);
+  res.once("close", onResponseClose);
+  if (req.aborted || (res.destroyed && !res.writableEnded)) {
+    abort();
+  }
+  return {
+    signal: controller.signal,
+    cleanup() {
+      req.removeListener("aborted", abort);
+      res.removeListener("close", onResponseClose);
+    },
+  };
+}
+
+class ToolCallIdempotency {
+  constructor({ ttlMs, maxEntries, now = () => Date.now() }) {
+    this.ttlMs = ttlMs;
+    this.maxEntries = maxEntries;
+    this.now = now;
+    this.entries = new Map();
+  }
+
+  async execute({ key, hash, subject, sessionId, signal, start }) {
+    this.#reap();
+    if (signal?.aborted) {
+      throw signal.reason;
+    }
+
+    let entry = this.entries.get(key);
+    if (entry) {
+      if (entry.hash !== hash) {
+        throw Object.assign(
+          new Error("The JSON-RPC id was already used for a different tools/call payload in this MCP session."),
+          { name: "IdempotencyConflict", code: "idempotency_conflict" },
+        );
+      }
+    } else {
+      this.#makeRoom();
+      const controller = new AbortController();
+      entry = {
+        hash,
+        subject,
+        sessionId,
+        controller,
+        state: "pending",
+        subscribers: 0,
+        expiresAt: Number.POSITIVE_INFINITY,
+        promise: null,
+      };
+      this.entries.set(key, entry);
+      entry.promise = Promise.resolve()
+        .then(() => start(controller.signal))
+        .then(
+          (value) => {
+            this.#settle(key, entry);
+            return value;
+          },
+          (error) => {
+            this.#settle(key, entry);
+            throw error;
+          },
+        );
+      // A disconnected sole subscriber can leave the shared operation settling
+      // asynchronously. Keep its rejection observed while retaining it for retry.
+      void entry.promise.catch(() => {});
+    }
+
+    return await this.#subscribe(entry, signal);
+  }
+
+  invalidateSession({ subject, sessionId, message = "MCP session terminated." }) {
+    const reason = Object.assign(new Error(message), { name: "AbortError" });
+    for (const [key, entry] of this.entries) {
+      if (entry.subject !== subject || entry.sessionId !== sessionId) {
+        continue;
+      }
+      this.entries.delete(key);
+      if (entry.state === "pending" && !entry.controller.signal.aborted) {
+        entry.controller.abort(reason);
+      }
+    }
+  }
+
+  shutdown(message = "Relay is shutting down.") {
+    const reason = Object.assign(new Error(message), { name: "AbortError" });
+    for (const entry of this.entries.values()) {
+      if (entry.state === "pending" && !entry.controller.signal.aborted) {
+        entry.controller.abort(reason);
+      }
+    }
+    this.entries.clear();
+  }
+
+  async #subscribe(entry, signal) {
+    entry.subscribers += 1;
+    return await new Promise((resolve, reject) => {
+      let finished = false;
+      const release = () => {
+        if (finished) {
+          return false;
+        }
+        finished = true;
+        signal?.removeEventListener("abort", onAbort);
+        entry.subscribers -= 1;
+        return true;
+      };
+      const onAbort = () => {
+        if (!release()) {
+          return;
+        }
+        const reason = signal.reason ?? Object.assign(new Error("MCP client disconnected."), {
+          name: "AbortError",
+        });
+        if (
+          entry.state === "pending" &&
+          entry.subscribers === 0 &&
+          !entry.controller.signal.aborted
+        ) {
+          entry.controller.abort(reason);
+        }
+        reject(reason);
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
+      entry.promise.then(
+        (value) => {
+          if (release()) {
+            resolve(value);
+          }
+        },
+        (error) => {
+          if (release()) {
+            reject(error);
+          }
+        },
+      );
+    });
+  }
+
+  #settle(key, entry) {
+    if (this.entries.get(key) !== entry) {
+      return;
+    }
+    entry.state = "settled";
+    entry.expiresAt = this.now() + this.ttlMs;
+  }
+
+  #makeRoom() {
+    while (this.entries.size >= this.maxEntries) {
+      const settled = [...this.entries].find(([, entry]) => entry.state === "settled");
+      if (!settled) {
+        throw new Error("Relay idempotency registry is full.");
+      }
+      this.entries.delete(settled[0]);
+    }
+  }
+
+  #reap() {
+    const now = this.now();
+    for (const [key, entry] of this.entries) {
+      if (entry.state === "settled" && entry.expiresAt <= now) {
+        this.entries.delete(key);
+      }
+    }
+  }
+}
+
 function remoteAddress(req, trustProxy = false) {
   const forwarded = req.headers["x-forwarded-for"];
   if (trustProxy && typeof forwarded === "string" && forwarded.trim()) {
@@ -325,8 +652,14 @@ function requireScope(auth, scope) {
 
 function sanitizedError(error) {
   return {
-    type: error?.name ?? "Error",
-    message: String(error?.message ?? error),
+    type: sanitizeErrorText(error?.name ?? "Error", 128).replace(
+      /[\u0000-\u001f\u007f]/g,
+      " ",
+    ),
+    message: sanitizeErrorText(error?.message ?? error).replace(
+      /[\u0000-\u001f\u007f]/g,
+      " ",
+    ),
   };
 }
 
@@ -440,16 +773,22 @@ export function createHostingerRelayServer({
             throw new Error("OAuth is required for the public MCP endpoint.");
           }
           auth = await config.oauth.verifyRequest(req);
+          if (typeof auth.subject !== "string" || !auth.subject.trim()) {
+            throw Object.assign(new Error("OAuth access token must contain a nonempty subject."), {
+              code: "invalid_token",
+            });
+          }
         } catch (error) {
+          const safeMessage = sanitizeErrorText(error?.message ?? error);
           json(
             res,
             401,
-            { error: "unauthorized", message: error.message },
+            { error: "unauthorized", message: safeMessage },
             {
               "www-authenticate": bearerChallenge({
                 publicUrl: config.publicUrl,
                 error: error.code ?? "invalid_token",
-                errorDescription: error.message,
+                errorDescription: safeMessage.replace(/[\u0000-\u001f\u007f]/g, " "),
               }),
             },
           );
@@ -493,7 +832,10 @@ export function createHostingerRelayServer({
           if (isAgentResult) {
             config.agentAuthFailureLimiter.record(preAuthAddress);
           }
-          json(res, 401, { error: "unauthorized", message: error.message });
+          json(res, 401, {
+            error: "unauthorized",
+            message: sanitizeErrorText(error?.message ?? error),
+          });
           return;
         }
         const agentRateLimiter = isAgentResult
@@ -518,13 +860,15 @@ export function createHostingerRelayServer({
               ? "invalid_json"
               : "internal_error",
         requestId,
-        message: error.message,
+        message: sanitizeErrorText(error?.message ?? error),
       });
     }
   });
 
   server.queue = {
     shutdown(message) {
+      state.config?.sessions?.shutdown(message);
+      state.config?.idempotency?.shutdown(message);
       state.config?.queue?.shutdown(message);
     },
   };
@@ -570,13 +914,28 @@ export function createHostingerRelayServer({
     });
   }
 
-  server.on("close", () => monitor.stop());
+  server.on("close", () => {
+    monitor.stop();
+    state.config?.sessions?.shutdown("Relay server closed.");
+    state.config?.idempotency?.shutdown("Relay server closed.");
+    state.config?.queue?.shutdown("Relay server closed.");
+  });
 
   return server;
 }
 
 async function handleMcp({ req, res, parsed, config, auth }) {
+  const subject = auth.subject;
   if (req.method === "DELETE") {
+    try {
+      config.sessions.terminate(req, subject);
+    } catch (error) {
+      json(res, error.statusCode ?? 400, {
+        error: error.code ?? "invalid_mcp_session",
+        message: sanitizeErrorText(error?.message ?? error),
+      });
+      return;
+    }
     res.writeHead(204, { "cache-control": "no-store" });
     res.end();
     return;
@@ -592,6 +951,19 @@ async function handleMcp({ req, res, parsed, config, auth }) {
     json(res, 400, rpcError(message?.id, -32600, "Invalid JSON-RPC request."));
     return;
   }
+
+  let sessionId;
+  if (message.method !== "initialize") {
+    try {
+      sessionId = config.sessions.require(req, subject);
+    } catch (error) {
+      json(res, error.statusCode ?? 400, {
+        error: error.code ?? "invalid_mcp_session",
+        message: sanitizeErrorText(error?.message ?? error),
+      });
+      return;
+    }
+  }
   if (message.id === undefined) {
     res.writeHead(202, { "cache-control": "no-store" });
     res.end();
@@ -601,12 +973,14 @@ async function handleMcp({ req, res, parsed, config, auth }) {
   let result;
   switch (message.method) {
     case "initialize":
+      sessionId = config.sessions.issue(subject);
+      res.setHeader("mcp-session-id", sessionId);
       result = {
-        protocolVersion: message.params?.protocolVersion ?? DEFAULT_PROTOCOL_VERSION,
+        protocolVersion: negotiateProtocolVersion(message.params?.protocolVersion),
         capabilities: { tools: { listChanged: false } },
         serverInfo: {
-          name: "biotele-hostinger-relay",
-          title: "Biotele Hostinger MCP Relay",
+          name: "biotele-codex-supervisor",
+          title: "Biotele Codex Supervisor",
           version: VERSION,
         },
         instructions:
@@ -652,20 +1026,53 @@ async function handleMcp({ req, res, parsed, config, auth }) {
         return;
       }
 
+      const requestWait = disconnectSignal(req, res);
       try {
-        const job = config.queue.enqueue({
-          toolName: name,
-          arguments: args,
-          requestId: String(message.id),
-          resultTimeoutMs: Math.min(config.mcpWaitMs, config.queue.jobTtlMs),
-        });
-        const outcome = await config.queue.waitForResult(job, {
-          timeoutMs: Math.min(config.mcpWaitMs, config.queue.jobTtlMs),
+        const key = canonicalJson([
+          subject,
+          sessionId,
+          typedRpcId(message.id),
+        ]);
+        const outcome = await config.idempotency.execute({
+          key,
+          hash: toolCallHash(message),
+          subject,
+          sessionId,
+          signal: requestWait.signal,
+          start: async (signal) => {
+            const timeoutMs = Math.min(config.mcpWaitMs, config.queue.jobTtlMs);
+            const job = config.queue.enqueue({
+              toolName: name,
+              arguments: args,
+              requestId: String(message.id),
+              resultTimeoutMs: timeoutMs,
+            });
+            return await config.queue.waitForResult(job, {
+              timeoutMs,
+              signal,
+            });
+          },
         });
         result = outcome.result ?? toolErrorResult(outcome.error);
       } catch (error) {
-        json(res, 200, rpcError(message.id, -32000, error.message));
+        if (requestWait.signal.aborted) {
+          return;
+        }
+        json(
+          res,
+          200,
+          rpcError(
+            message.id,
+            error?.code === "idempotency_conflict" ? -32009 : -32000,
+            error.message,
+            error?.code === "idempotency_conflict"
+              ? { type: "IdempotencyConflict" }
+              : undefined,
+          ),
+        );
         return;
+      } finally {
+        requestWait.cleanup();
       }
       break;
     }
@@ -791,7 +1198,10 @@ async function handleAgent({ req, res, url, parsed, config, monitor, auth }) {
       error: legacyPayload.error,
     });
   } catch (error) {
-    json(res, 409, { error: "result_rejected", message: error.message });
+    json(res, 409, {
+      error: "result_rejected",
+      message: sanitizeErrorText(error?.message ?? error),
+    });
     return;
   }
   json(res, 202, { accepted: true });

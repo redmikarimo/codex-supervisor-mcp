@@ -20,6 +20,7 @@ test("PathPolicy allows roots and rejects escapes", async (t) => {
 
   const policy = await PathPolicy.create({ allowedRoots: [root] });
   assert.equal(await policy.resolveCwd(repository), await fs.realpath(repository));
+  assert.equal(await policy.resolveStoredPath(repository), await fs.realpath(repository));
   await assert.rejects(() => policy.resolveCwd(outside), /outside CODEX_ALLOWED_ROOTS/);
 
   const link = path.join(root, "escape-link");
@@ -31,4 +32,11 @@ test("PathPolicy allows roots and rejects escapes", async (t) => {
       throw error;
     }
   }
+
+  const missing = path.join(await fs.realpath(root), "missing-repository");
+  assert.equal(await policy.resolveStoredPath(missing), path.resolve(missing));
+  await assert.rejects(
+    () => policy.resolveStoredPath(missing, { mustExist: true }),
+    /does not exist/,
+  );
 });
