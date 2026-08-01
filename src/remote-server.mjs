@@ -2,13 +2,16 @@
 
 import { createHash, createPublicKey, randomUUID, verify as verifySignature } from "node:crypto";
 import http from "node:http";
+import { fileURLToPath } from "node:url";
 
+import { sanitizeErrorData, sanitizeErrorText } from "./error-sanitization.mjs";
 import { AppServerError } from "./errors.mjs";
 import { CodexSupervisorService } from "./supervisor-service.mjs";
 import { createToolRegistry } from "./tool-registry.mjs";
 
-const VERSION = "1.1.0";
+const VERSION = "1.2.4";
 const DEFAULT_PROTOCOL_VERSION = "2025-11-25";
+const SUPPORTED_PROTOCOL_VERSIONS = new Set([DEFAULT_PROTOCOL_VERSION]);
 const MAX_BODY_BYTES = Number.parseInt(process.env.CODEX_REMOTE_MAX_BODY_BYTES ?? "1048576", 10);
 const HOST = process.env.CODEX_REMOTE_HOST ?? "127.0.0.1";
 const PORT = Number.parseInt(process.env.CODEX_REMOTE_PORT ?? "8787", 10);
@@ -17,11 +20,56 @@ const AUTH_MODE = (process.env.CODEX_REMOTE_AUTH_MODE ?? "bearer").toLowerCase()
 const BEARER_TOKEN = process.env.CODEX_REMOTE_BEARER_TOKEN ?? "";
 const OAUTH_ISSUER = (process.env.CODEX_REMOTE_OAUTH_ISSUER ?? "").replace(/\/+$/, "");
 const OAUTH_AUDIENCE = process.env.CODEX_REMOTE_OAUTH_AUDIENCE ?? "";
+const OAUTH_READ_SCOPE = (
+  process.env.CODEX_REMOTE_OAUTH_READ_SCOPE ?? "biotele.mcp.read"
+).trim();
+const OAUTH_WRITE_SCOPE = (
+  process.env.CODEX_REMOTE_OAUTH_WRITE_SCOPE ?? "biotele.mcp.write"
+).trim();
 const PUBLIC_URL = (process.env.CODEX_REMOTE_PUBLIC_URL ?? "").replace(/\/+$/, "");
 const RATE_LIMIT = Number.parseInt(process.env.CODEX_REMOTE_RATE_LIMIT_PER_MINUTE ?? "60", 10);
+const MCP_SESSION_PATTERN = /^[\x21-\x7e]{1,128}$/;
 
 const rateBuckets = new Map();
 let jwksCache = { expiresAt: 0, keys: new Map() };
+let oauthMetadataCache = null;
+
+const READ_TOOLS = new Set([
+  "codex_status",
+  "codex_wait",
+  "codex_list_threads",
+  "codex_read_thread",
+  "codex_list_approvals",
+]);
+const WRITE_TOOLS = new Set([
+  "codex_start",
+  "codex_send",
+  "codex_steer",
+  "codex_interrupt",
+  "codex_resolve_approval",
+]);
+
+function requestKey(id) {
+  return `${typeof id}:${JSON.stringify(id)}`;
+}
+
+function requestSessionNamespace(req) {
+  const header = req.headers["mcp-session-id"];
+  if (header === undefined) {
+    return "no-session";
+  }
+  if (Array.isArray(header) || !MCP_SESSION_PATTERN.test(header)) {
+    throw new Error(
+      "Mcp-Session-Id must be one visible ASCII value of at most 128 characters.",
+    );
+  }
+  return header;
+}
+
+function activeRequestKey(auth, sessionNamespace, id) {
+  const subject = String(auth?.subject ?? auth?.claims?.sub ?? "unknown");
+  return JSON.stringify([subject, sessionNamespace, requestKey(id)]);
+}
 
 function json(res, status, payload, headers = {}) {
   const body = payload === undefined ? "" : JSON.stringify(payload);
@@ -39,14 +87,84 @@ function rpcError(id, code, message, data) {
     id: id ?? null,
     error: {
       code,
-      message,
-      ...(data === undefined ? {} : { data }),
+      message: sanitizeErrorText(message),
+      ...(data === undefined ? {} : { data: sanitizeErrorData(data) }),
     },
   };
 }
 
 function clientAddress(req) {
   return req.socket.remoteAddress ?? "unknown";
+}
+
+function remoteToolSignal(req, res, timeoutMs) {
+  const controller = new AbortController();
+  let disconnected = false;
+  const disconnectReason = Object.assign(new Error("Remote MCP client disconnected."), {
+    name: "AbortError",
+  });
+  const abortForDisconnect = () => {
+    disconnected = true;
+    if (!controller.signal.aborted) {
+      controller.abort(disconnectReason);
+    }
+  };
+  const onResponseClose = () => {
+    if (!res.writableEnded) {
+      abortForDisconnect();
+    }
+  };
+  req.once("aborted", abortForDisconnect);
+  res.once("close", onResponseClose);
+  if (req.aborted || (res.destroyed && !res.writableEnded)) {
+    abortForDisconnect();
+  }
+
+  const timer = setTimeout(() => {
+    if (!controller.signal.aborted) {
+      controller.abort(
+        Object.assign(new Error("Remote MCP tool call timed out."), {
+          name: "TimeoutError",
+        }),
+      );
+    }
+  }, timeoutMs);
+  timer.unref?.();
+
+  return {
+    signal: controller.signal,
+    get disconnected() {
+      return disconnected;
+    },
+    cleanup() {
+      clearTimeout(timer);
+      req.removeListener("aborted", abortForDisconnect);
+      res.removeListener("close", onResponseClose);
+    },
+  };
+}
+
+async function raceWithAbort(promise, signal) {
+  let onAbort;
+  const aborted = new Promise((_, reject) => {
+    onAbort = () => {
+      reject(
+        signal.reason ??
+          Object.assign(new Error("Operation aborted."), { name: "AbortError" }),
+      );
+    };
+    if (signal.aborted) {
+      onAbort();
+    } else {
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+  });
+
+  try {
+    return await Promise.race([promise, aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
 }
 
 function checkRateLimit(req) {
@@ -88,17 +206,21 @@ function decodeJwtPart(value) {
 }
 
 async function oauthMetadata() {
+  if (oauthMetadataCache) {
+    return oauthMetadataCache;
+  }
   const response = await fetch(`${OAUTH_ISSUER}/.well-known/openid-configuration`, {
     signal: AbortSignal.timeout(10_000),
   });
   if (!response.ok) {
     throw new Error(`OAuth metadata request failed with HTTP ${response.status}`);
   }
-  return await response.json();
+  oauthMetadataCache = await response.json();
+  return oauthMetadataCache;
 }
 
-async function getJwks() {
-  if (Date.now() < jwksCache.expiresAt && jwksCache.keys.size > 0) {
+async function getJwks({ forceRefresh = false } = {}) {
+  if (!forceRefresh && Date.now() < jwksCache.expiresAt && jwksCache.keys.size > 0) {
     return jwksCache.keys;
   }
 
@@ -121,7 +243,20 @@ async function getJwks() {
   return keys;
 }
 
-async function verifyOAuthToken(token) {
+function extractScopes(payload) {
+  const values = [];
+  if (typeof payload?.scope === "string") {
+    values.push(...payload.scope.split(/\s+/));
+  }
+  if (typeof payload?.scp === "string") {
+    values.push(...payload.scp.split(/\s+/));
+  } else if (Array.isArray(payload?.scp)) {
+    values.push(...payload.scp);
+  }
+  return new Set(values.map((value) => String(value).trim()).filter(Boolean));
+}
+
+export async function verifyOAuthToken(token) {
   const parts = token.split(".");
   if (parts.length !== 3) {
     throw new Error("Malformed JWT");
@@ -135,10 +270,13 @@ async function verifyOAuthToken(token) {
     throw new Error("Only RS256 JWTs with a kid are accepted");
   }
 
-  const keys = await getJwks();
-  const jwk = keys.get(header.kid);
+  let keys = await getJwks();
+  let jwk = keys.get(header.kid);
   if (!jwk) {
-    jwksCache.expiresAt = 0;
+    keys = await getJwks({ forceRefresh: true });
+    jwk = keys.get(header.kid);
+  }
+  if (!jwk) {
     throw new Error("JWT signing key was not found");
   }
 
@@ -165,12 +303,16 @@ async function verifyOAuthToken(token) {
     throw new Error("Invalid JWT audience");
   }
 
-  return payload;
+  return {
+    subject: payload.sub ?? null,
+    claims: payload,
+    scopes: extractScopes(payload),
+  };
 }
 
 async function authorize(req) {
   if (AUTH_MODE === "none") {
-    return { subject: "anonymous" };
+    return { subject: "anonymous", scopes: new Set() };
   }
 
   const token = bearer(req);
@@ -182,7 +324,7 @@ async function authorize(req) {
     if (!BEARER_TOKEN || !timingSafeStringEqual(token, BEARER_TOKEN)) {
       throw new Error("Invalid bearer token");
     }
-    return { subject: "bearer-user" };
+    return { subject: "bearer-user", scopes: new Set() };
   }
 
   if (AUTH_MODE === "oauth") {
@@ -190,6 +332,57 @@ async function authorize(req) {
   }
 
   throw new Error(`Unsupported CODEX_REMOTE_AUTH_MODE: ${AUTH_MODE}`);
+}
+
+export function negotiateProtocolVersion(requestedVersion) {
+  return SUPPORTED_PROTOCOL_VERSIONS.has(requestedVersion)
+    ? requestedVersion
+    : DEFAULT_PROTOCOL_VERSION;
+}
+
+export function validateOAuthScopeConfig(readScope, writeScope) {
+  if (!readScope || !writeScope) {
+    throw new Error("OAuth read and write scopes must both be non-empty");
+  }
+  if (readScope === writeScope) {
+    throw new Error("OAuth read and write scopes must be distinct");
+  }
+}
+
+export function requiredOAuthScope(
+  toolName,
+  { readScope = OAUTH_READ_SCOPE, writeScope = OAUTH_WRITE_SCOPE } = {},
+) {
+  if (READ_TOOLS.has(toolName)) {
+    return readScope;
+  }
+  if (WRITE_TOOLS.has(toolName)) {
+    return writeScope;
+  }
+  return null;
+}
+
+function requireOAuthScope(auth, requiredScope) {
+  if (auth?.scopes?.has?.(requiredScope)) {
+    return;
+  }
+  const error = new Error(`Missing required OAuth scope: ${requiredScope}`);
+  error.scope = requiredScope;
+  throw error;
+}
+
+function challengeValue(value) {
+  return sanitizeErrorText(value, 512).replace(/["\r\n]/g, "");
+}
+
+function oauthBearerChallenge({ publicUrl, error, errorDescription } = {}) {
+  const metadataUrl = publicUrl
+    ? `${publicUrl}/.well-known/oauth-protected-resource`
+    : "/.well-known/oauth-protected-resource";
+  const details = errorDescription
+    ? `, error_description="${challengeValue(errorDescription)}"`
+    : "";
+  return `Bearer resource_metadata="${challengeValue(metadataUrl)}", error="${challengeValue(error ?? "invalid_token")}"${details}`;
 }
 
 function assertPositiveInteger(value, name) {
@@ -221,6 +414,7 @@ function validateStartupConfig() {
     if (!OAUTH_ISSUER || !OAUTH_AUDIENCE) {
       throw new Error("CODEX_REMOTE_OAUTH_ISSUER and CODEX_REMOTE_OAUTH_AUDIENCE are required in OAuth mode");
     }
+    validateOAuthScopeConfig(OAUTH_READ_SCOPE, OAUTH_WRITE_SCOPE);
     return;
   }
 
@@ -259,13 +453,13 @@ function errorToolResult(error) {
   return completeToolResult(
     {
       error: {
-        type: error?.name ?? "Error",
-        message: error?.message ?? String(error),
+        type: sanitizeErrorText(error?.name ?? "Error", 128),
+        message: sanitizeErrorText(error?.message ?? String(error)),
         ...(error instanceof AppServerError
           ? {
-              code: error.code ?? null,
-              method: error.method ?? null,
-              data: error.data ?? null,
+              code: sanitizeErrorData(error.code ?? null),
+              method: sanitizeErrorText(error.method ?? "", 256) || null,
+              data: sanitizeErrorData(error.data ?? null),
             }
           : {}),
       },
@@ -274,16 +468,22 @@ function errorToolResult(error) {
   );
 }
 
-async function main() {
-  validateStartupConfig();
-  if (HOST !== "127.0.0.1" && HOST !== "::1" && AUTH_MODE === "none") {
-    throw new Error("Unauthenticated mode may bind only to loopback");
+export function createRemoteHttpServer({
+  tools,
+  authorizeRequest = authorize,
+  authMode = AUTH_MODE,
+  pathname = PATHNAME,
+  publicUrl = PUBLIC_URL,
+  oauthIssuer = OAUTH_ISSUER,
+  readScope = OAUTH_READ_SCOPE,
+  writeScope = OAUTH_WRITE_SCOPE,
+} = {}) {
+  if (!tools) {
+    throw new Error("A tool registry is required");
   }
+  const activeRequestIds = new Set();
 
-  const service = await CodexSupervisorService.create();
-  const tools = createToolRegistry(service);
-
-  const server = http.createServer(async (req, res) => {
+  return http.createServer(async (req, res) => {
     const requestId = req.headers["x-request-id"] ?? randomUUID();
     res.setHeader("x-request-id", requestId);
 
@@ -300,34 +500,37 @@ async function main() {
         return;
       }
 
-      if (url.pathname === "/.well-known/oauth-protected-resource" && AUTH_MODE === "oauth") {
+      if (url.pathname === "/.well-known/oauth-protected-resource" && authMode === "oauth") {
         json(res, 200, {
-          resource: PUBLIC_URL ? `${PUBLIC_URL}${PATHNAME}` : PATHNAME,
-          authorization_servers: [OAUTH_ISSUER],
+          resource: publicUrl ? `${publicUrl}${pathname}` : pathname,
+          authorization_servers: [oauthIssuer],
           bearer_methods_supported: ["header"],
+          scopes_supported: [readScope, writeScope],
         });
         return;
       }
 
-      if (url.pathname !== PATHNAME) {
+      if (url.pathname !== pathname) {
         json(res, 404, { error: "not_found" });
         return;
       }
 
+      let auth;
       try {
-        await authorize(req);
+        auth = await authorizeRequest(req);
       } catch (error) {
-        const metadataUrl = PUBLIC_URL
-          ? `${PUBLIC_URL}/.well-known/oauth-protected-resource`
-          : "/.well-known/oauth-protected-resource";
         json(
           res,
           401,
-          { error: "unauthorized", message: error.message },
+          { error: "unauthorized", message: sanitizeErrorText(error?.message ?? String(error)) },
           {
             "www-authenticate":
-              AUTH_MODE === "oauth"
-                ? `Bearer resource_metadata="${metadataUrl}"`
+              authMode === "oauth"
+                ? oauthBearerChallenge({
+                    publicUrl,
+                    error: "invalid_token",
+                    errorDescription: error?.message ?? String(error),
+                  })
                 : 'Bearer realm="codex-supervisor"',
           },
         );
@@ -364,12 +567,32 @@ async function main() {
         return;
       }
 
-      let result;
-      switch (message.method) {
+      let sessionNamespace;
+      try {
+        sessionNamespace = requestSessionNamespace(req);
+      } catch (error) {
+        json(res, 400, rpcError(message.id, -32600, error.message));
+        return;
+      }
+
+      const activeKey = activeRequestKey(auth, sessionNamespace, message.id);
+      if (activeRequestIds.has(activeKey)) {
+        json(
+          res,
+          200,
+          rpcError(message.id, -32600, "Duplicate active JSON-RPC request id."),
+        );
+        return;
+      }
+
+      activeRequestIds.add(activeKey);
+      try {
+        let result;
+        switch (message.method) {
         case "initialize":
+          res.setHeader("mcp-session-id", randomUUID());
           result = {
-            protocolVersion:
-              message.params?.protocolVersion ?? DEFAULT_PROTOCOL_VERSION,
+            protocolVersion: negotiateProtocolVersion(message.params?.protocolVersion),
             capabilities: { tools: { listChanged: false } },
             serverInfo: {
               name: "codex-supervisor-remote",
@@ -386,6 +609,20 @@ async function main() {
           break;
 
         case "tools/list":
+          if (authMode === "oauth") {
+            try {
+              requireOAuthScope(auth, readScope);
+            } catch (error) {
+              json(
+                res,
+                200,
+                rpcError(message.id, -32001, error.message, {
+                  requiredScope: error.scope,
+                }),
+              );
+              return;
+            }
+          }
           result = { tools: tools.definitions };
           break;
 
@@ -397,15 +634,57 @@ async function main() {
             return;
           }
 
+          if (authMode === "oauth") {
+            const requiredScope = requiredOAuthScope(name, { readScope, writeScope });
+            if (!requiredScope) {
+              json(
+                res,
+                200,
+                rpcError(
+                  message.id,
+                  -32602,
+                  `Unknown authorization category for tool: ${String(name)}`,
+                ),
+              );
+              return;
+            }
+            try {
+              requireOAuthScope(auth, requiredScope);
+            } catch (error) {
+              json(
+                res,
+                200,
+                rpcError(message.id, -32001, error.message, {
+                  requiredScope: error.scope,
+                }),
+              );
+              return;
+            }
+          }
+
+          const execution = remoteToolSignal(
+            req,
+            res,
+            Number.parseInt(process.env.CODEX_REMOTE_TOOL_TIMEOUT_MS ?? "900000", 10),
+          );
           try {
-            const output = await tools.call(name, args, {
-              signal: AbortSignal.timeout(
-                Number.parseInt(process.env.CODEX_REMOTE_TOOL_TIMEOUT_MS ?? "900000", 10),
-              ),
-            });
+            const output = await raceWithAbort(
+              tools.call(name, args, {
+                signal: execution.signal,
+              }),
+              execution.signal,
+            );
+            if (execution.disconnected) {
+              return;
+            }
             result = completeToolResult(output);
           } catch (error) {
+            if (execution.disconnected) {
+              return;
+            }
             result = errorToolResult(error);
+          } finally {
+            execution.cleanup();
           }
           break;
         }
@@ -415,19 +694,33 @@ async function main() {
           return;
       }
 
-      json(res, 200, {
-        jsonrpc: "2.0",
-        id: message.id,
-        result,
-      });
+        json(res, 200, {
+          jsonrpc: "2.0",
+          id: message.id,
+          result,
+        });
+      } finally {
+        activeRequestIds.delete(activeKey);
+      }
     } catch (error) {
       json(res, 500, {
         error: "internal_error",
         requestId,
-        message: error?.message ?? String(error),
+        message: sanitizeErrorText(error?.message ?? String(error)),
       });
     }
   });
+}
+
+async function main() {
+  validateStartupConfig();
+  if (HOST !== "127.0.0.1" && HOST !== "::1" && AUTH_MODE === "none") {
+    throw new Error("Unauthenticated mode may bind only to loopback");
+  }
+
+  const service = await CodexSupervisorService.create();
+  const tools = createToolRegistry(service);
+  const server = createRemoteHttpServer({ tools });
 
   const shutdown = async () => {
     server.close();
@@ -444,7 +737,9 @@ async function main() {
   });
 }
 
-main().catch((error) => {
-  process.stderr.write(`${error?.stack ?? error}\n`);
-  process.exitCode = 1;
-});
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+  main().catch((error) => {
+    process.stderr.write(`${sanitizeErrorText(error?.stack ?? error)}\n`);
+    process.exitCode = 1;
+  });
+}

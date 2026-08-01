@@ -265,6 +265,44 @@ codex_resolve_approval
 If the expected `scope` or `scp` claim is absent, the relay fails closed with a
 JSON-RPC authorization error.
 
+### ChatGPT web connector setup
+
+Use the production relay, not the loopback `remote-server.mjs` endpoint:
+
+```text
+Display name: Biotele Codex Supervisor
+MCP URL:      https://mcp.biotele.mx/mcp
+Read scope:   biotele.mcp.read
+Write scope:  biotele.mcp.write
+```
+
+1. In ChatGPT, open **Settings → Apps → Advanced settings** and enable developer
+   mode if custom app creation is not already available.
+2. Open **Settings → Apps → Connectors** (or
+   `https://chatgpt.com/apps#settings/Connectors`) and choose **Create app**.
+3. Enter the display name and MCP URL above, select OAuth, and complete the
+   Auth0 authorization flow. Never paste an access token into a chat.
+4. Start a chat, choose **Add files and more**, and select
+   **Biotele Codex Supervisor**. In the standard Chat surface this may appear as
+   an inline app mention in the composer.
+5. Begin with a read-only call such as `codex_list_threads` and confirm the
+   returned allowed roots. Use `codex_start`, then `codex_wait` or
+   `codex_status`, for actual work.
+6. ChatGPT asks before selected action tools. Inspect the summarized tool input
+   and use **Allow once** unless a broader permission is intentionally desired.
+
+If a conversation can still list the tool names but reports that a deferred
+tool binding is unavailable, explicitly attach the app again in the next
+prompt. If that does not restore the binding, start a standard Chat conversation
+and attach the app there. A Work-usage or credit banner is a ChatGPT account
+billing boundary, not evidence that the relay or Windows agent is unhealthy.
+
+Reauthenticate the connector only when `/mcp` returns `401`, the OAuth consent
+is missing, or the required scopes changed. After reconnecting, verify
+`codex_list_threads`, `codex_list_approvals`, and—after explicit approval—one
+disposable write-scoped `codex_start`/`codex_wait` round trip before allowing
+production work.
+
 ## Agent Authentication
 
 Only local-agent routes use HMAC:
@@ -308,6 +346,18 @@ request window, the result is an MCP tool error indicating timeout. For long
 Codex work, call `codex_start`, then poll with `codex_wait` or `codex_status`.
 `codex_read_thread` omits full turns by default; request `includeTurns=true`
 only when the larger persisted history is required.
+
+The relay negotiates unsupported legacy protocol requests to its supported
+fallback and returns `Mcp-Session-Id` from `initialize`. Subsequent MCP requests
+must return that visible-ASCII session header with the same OAuth subject. Issued
+sessions use a bounded registry and a sliding 24-hour lifetime. Identical
+`tools/call` retries with the same OAuth subject, MCP session, typed JSON-RPC id,
+and canonical request hash share one in-flight job and a bounded cached result.
+Reusing that identity with a different payload fails with JSON-RPC `-32009`.
+`DELETE /mcp` validates ownership, terminates the session, and invalidates or
+cancels its cached and pending work. If every client waiting for a shared call
+disconnects, the queued or leased job is cancelled and late claims or results
+are rejected.
 
 The relay advertises `base64url-json-chunked-v1` to updated agents. Each result
 is serialized once, SHA-256 hashed, split into bounded chunks, and carried in
@@ -463,14 +513,15 @@ Run the full test suite before deployment:
 npm test
 ```
 
-For v1.2.3, deploy and verify the Hostinger relay first. Then run the Windows
+For v1.2.4, deploy and verify the Hostinger relay first. Then run the Windows
 installer and restart the scheduled task. This order is rollback-safe because
 the new relay accepts both result formats and the new agent uses chunking only
 when the relay advertises it.
 
 Relay tests cover authentication, expiry, replay rejection, queue lifecycle,
 timeout, duplicate delivery lease rejection, OAuth token validation, scope
-authorization, protected-resource metadata, boundary rejection between OAuth and
-agent HMAC, synthetic monitor test alerts, result submission, local-agent task
-restart settings, native Codex discovery, child-secret isolation, chunked large
-results, and a mocked local-agent integration.
+authorization, protocol negotiation, subject-bound MCP session lifecycle,
+protected-resource metadata, boundary rejection between OAuth and agent HMAC,
+synthetic monitor test alerts, result submission, local-agent task restart
+settings, native Codex discovery, child-secret isolation, chunked large results,
+and a mocked local-agent integration.

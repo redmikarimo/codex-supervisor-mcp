@@ -177,15 +177,31 @@ function splitAgentEnv({ agentSecret = AGENT_SECRET, issuer = "https://issuer.ex
   return env;
 }
 
-async function oauthPost(baseUrl, path, bodyObject, token) {
+async function oauthPost(baseUrl, path, bodyObject, token, extraHeaders = {}) {
   return await fetch(`${baseUrl}${path}`, {
     method: "POST",
     headers: {
       "content-type": "application/json",
       authorization: `Bearer ${token}`,
+      ...extraHeaders,
     },
     body: JSON.stringify(bodyObject),
   });
+}
+
+async function initializeMcpSession(baseUrl, token, protocolVersion = "2025-11-25") {
+  const response = await oauthPost(baseUrl, "/mcp", {
+    jsonrpc: "2.0",
+    id: `initialize-${Math.random()}`,
+    method: "initialize",
+    params: { protocolVersion },
+  }, token);
+  assert.equal(response.status, 200);
+  const payload = await response.json();
+  assert.equal(payload.result.protocolVersion, "2025-11-25");
+  const sessionId = response.headers.get("mcp-session-id");
+  assert.match(sessionId, /^[\x21-\x7e]{1,128}$/);
+  return sessionId;
 }
 
 async function agentSignedPost(
@@ -776,7 +792,14 @@ test("relay refreshes JWKS after unknown kid", async (t) => {
   });
   const baseUrl = await withRelay(t, { issuer: idp.issuer });
   const token = mintJwt({ issuer: idp.issuer, key: rotatedKey });
-  const response = await oauthPost(baseUrl, "/mcp", { jsonrpc: "2.0", id: 1, method: "ping" }, token);
+  const sessionId = await initializeMcpSession(baseUrl, token);
+  const response = await oauthPost(
+    baseUrl,
+    "/mcp",
+    { jsonrpc: "2.0", id: 1, method: "ping" },
+    token,
+    { "mcp-session-id": sessionId },
+  );
   assert.equal(response.status, 200);
   assert.equal(idp.jwksRequests(), 2);
 });
@@ -786,7 +809,14 @@ test("relay permits valid read scope for tools/list", async (t) => {
   const idp = await withIdentityProvider(t, { keys: [key] });
   const baseUrl = await withRelay(t, { issuer: idp.issuer });
   const token = mintJwt({ issuer: idp.issuer, key, scope: READ_SCOPE });
-  const response = await oauthPost(baseUrl, "/mcp", { jsonrpc: "2.0", id: 1, method: "tools/list" }, token);
+  const sessionId = await initializeMcpSession(baseUrl, token);
+  const response = await oauthPost(
+    baseUrl,
+    "/mcp",
+    { jsonrpc: "2.0", id: 1, method: "tools/list" },
+    token,
+    { "mcp-session-id": sessionId },
+  );
   assert.equal(response.status, 200);
   const payload = await response.json();
   assert.ok(payload.result.tools.some((tool) => tool.name === "codex_wait"));
@@ -798,6 +828,7 @@ test("relay denies write tool without write scope", async (t) => {
   const queue = new RelayQueue();
   const baseUrl = await withRelay(t, { issuer: idp.issuer, queue });
   const token = mintJwt({ issuer: idp.issuer, key, scope: READ_SCOPE });
+  const sessionId = await initializeMcpSession(baseUrl, token);
   const response = await oauthPost(
     baseUrl,
     "/mcp",
@@ -808,6 +839,7 @@ test("relay denies write tool without write scope", async (t) => {
       params: { name: "codex_start", arguments: { cwd: "C:\\repo", prompt: "go" } },
     },
     token,
+    { "mcp-session-id": sessionId },
   );
   assert.equal(response.status, 200);
   const payload = await response.json();
@@ -820,6 +852,7 @@ test("relay permits write tool with write scope", async (t) => {
   const idp = await withIdentityProvider(t, { keys: [key] });
   const baseUrl = await withRelay(t, { issuer: idp.issuer });
   const token = mintJwt({ issuer: idp.issuer, key, scope: WRITE_SCOPE });
+  const sessionId = await initializeMcpSession(baseUrl, token);
   const mcpCall = oauthPost(
     baseUrl,
     "/mcp",
@@ -830,6 +863,7 @@ test("relay permits write tool with write scope", async (t) => {
       params: { name: "codex_interrupt", arguments: { threadId: "thread-1" } },
     },
     token,
+    { "mcp-session-id": sessionId },
   );
   const claimResponse = await agentSignedPost(baseUrl, "/agent/jobs/claim", { maxWaitMs: 100 });
   assert.equal(claimResponse.status, 200);
@@ -883,7 +917,7 @@ test("relay accepts agent HMAC credentials on agent status route", async (t) => 
   assert.equal(response.status, 200);
   const payload = await response.json();
   assert.equal(payload.status, "ok");
-  assert.equal(payload.version, "1.2.3");
+  assert.equal(payload.version, "1.2.4");
   assert.equal(payload.resultSubmission.preferredProtocol, RESULT_SUBMISSION_PROTOCOL);
   assert.ok(payload.resultSubmission.maxResultBytes >= 262_144);
   assert.ok(payload.resultSubmission.chunkBytes <= 32 * 1024);
@@ -981,6 +1015,383 @@ test("relay does not echo bearer token in auth failure body or challenge", async
   assert.doesNotMatch(response.headers.get("www-authenticate") ?? "", /sensitive\.access\.token/);
 });
 
+async function sessionMcpPost(baseUrl, bodyObject, token, sessionId = undefined) {
+  const response = await fetch(`${baseUrl}/mcp`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+      ...(sessionId === undefined ? {} : { "mcp-session-id": sessionId }),
+    },
+    body: JSON.stringify(bodyObject),
+  });
+  return { response, payload: await response.json() };
+}
+
+async function idempotencyFixture(t, { subject = "user-1" } = {}) {
+  const key = createRsaKey(`idempotency-${Math.random()}`);
+  const identity = await withIdentityProvider(t, { keys: [key] });
+  const queue = new RelayQueue({ jobTtlMs: 5_000, leaseMs: 5_000 });
+  const baseUrl = await withRelay(t, { queue, issuer: identity.issuer });
+  const token = mintJwt({
+    issuer: identity.issuer,
+    key,
+    subject,
+    scope: `${READ_SCOPE} ${WRITE_SCOPE}`,
+  });
+  const initialized = await sessionMcpPost(baseUrl, {
+    jsonrpc: "2.0",
+    id: "initialize-idempotency",
+    method: "initialize",
+    params: { protocolVersion: "2025-11-25" },
+  }, token);
+  const sessionId = initialized.response.headers.get("mcp-session-id");
+  assert.match(sessionId, /^[\x21-\x7e]{1,128}$/);
+  return { baseUrl, key, identity, queue, sessionId, token };
+}
+
+test("Hostinger initialize falls back from unsupported protocol versions", async (t) => {
+  const { baseUrl, token } = await idempotencyFixture(t);
+  const unsupported = await sessionMcpPost(baseUrl, {
+    jsonrpc: "2.0",
+    id: "unsupported-protocol",
+    method: "initialize",
+    params: { protocolVersion: "2099-01-01" },
+  }, token);
+  assert.equal(unsupported.response.status, 200);
+  assert.equal(unsupported.payload.result.protocolVersion, "2025-11-25");
+  assert.match(
+    unsupported.response.headers.get("mcp-session-id"),
+    /^[\x21-\x7e]{1,128}$/,
+  );
+});
+
+test("post-initialize MCP calls reject missing, malformed, unknown, and foreign sessions", async (t) => {
+  const { baseUrl, key, identity, sessionId, token } = await idempotencyFixture(t);
+  const request = {
+    jsonrpc: "2.0",
+    id: "session-validation",
+    method: "tools/list",
+  };
+
+  const missing = await sessionMcpPost(baseUrl, request, token);
+  assert.equal(missing.response.status, 400);
+  assert.equal(missing.payload.error, "mcp_session_required");
+
+  const malformed = await sessionMcpPost(baseUrl, request, token, "bad session");
+  assert.equal(malformed.response.status, 400);
+  assert.equal(malformed.payload.error, "invalid_mcp_session");
+
+  const unknown = await sessionMcpPost(
+    baseUrl,
+    request,
+    token,
+    "00000000-0000-4000-8000-000000000000",
+  );
+  assert.equal(unknown.response.status, 404);
+  assert.equal(unknown.payload.error, "mcp_session_not_found");
+
+  const foreignToken = mintJwt({
+    issuer: identity.issuer,
+    key,
+    subject: "foreign-user",
+    scope: READ_SCOPE,
+  });
+  const foreign = await sessionMcpPost(baseUrl, request, foreignToken, sessionId);
+  assert.equal(foreign.response.status, 404);
+  assert.equal(foreign.payload.error, "mcp_session_not_found");
+});
+
+test("MCP session ownership preserves the opaque OAuth subject exactly", async (t) => {
+  const { baseUrl, key, identity, sessionId } = await idempotencyFixture(t, {
+    subject: " user-opaque ",
+  });
+  const trimmedToken = mintJwt({
+    issuer: identity.issuer,
+    key,
+    subject: "user-opaque",
+    scope: READ_SCOPE,
+  });
+  const foreign = await sessionMcpPost(baseUrl, {
+    jsonrpc: "2.0",
+    id: "opaque-subject",
+    method: "tools/list",
+  }, trimmedToken, sessionId);
+  assert.equal(foreign.response.status, 404);
+  assert.equal(foreign.payload.error, "mcp_session_not_found");
+});
+
+test("DELETE validates ownership, cancels pending session work, and invalidates the session", async (t) => {
+  const { baseUrl, key, identity, queue, sessionId, token } = await idempotencyFixture(t);
+  const foreignToken = mintJwt({
+    issuer: identity.issuer,
+    key,
+    subject: "foreign-user",
+    scope: READ_SCOPE,
+  });
+  const message = {
+    jsonrpc: "2.0",
+    id: "delete-session",
+    method: "tools/call",
+    params: { name: "codex_list_threads", arguments: {} },
+  };
+  const claim = queue.waitForClaimable({ timeoutMs: 1_000 });
+  const pending = sessionMcpPost(baseUrl, message, token, sessionId);
+  const job = await claim;
+
+  const foreignDelete = await fetch(`${baseUrl}/mcp`, {
+    method: "DELETE",
+    headers: {
+      authorization: `Bearer ${foreignToken}`,
+      "mcp-session-id": sessionId,
+    },
+  });
+  assert.equal(foreignDelete.status, 404);
+  assert.equal(queue.size, 1);
+
+  const deleted = await fetch(`${baseUrl}/mcp`, {
+    method: "DELETE",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "mcp-session-id": sessionId,
+    },
+  });
+  assert.equal(deleted.status, 204);
+  assert.equal(queue.size, 0);
+  assert.throws(
+    () => queue.complete({
+      jobId: job.id,
+      leaseId: job.leaseId,
+      result: { ok: true },
+    }),
+    /Unknown or expired job id/,
+  );
+
+  const cancelled = await pending;
+  assert.equal(cancelled.payload.error.code, -32000);
+  const afterDelete = await sessionMcpPost(baseUrl, message, token, sessionId);
+  assert.equal(afterDelete.response.status, 404);
+  assert.equal(afterDelete.payload.error, "mcp_session_not_found");
+});
+
+test("tools/call retries coalesce in flight and reuse the bounded cached outcome", async (t) => {
+  const { baseUrl, queue, sessionId, token } = await idempotencyFixture(t);
+  const message = {
+    jsonrpc: "2.0",
+    id: 77,
+    method: "tools/call",
+    params: { name: "codex_list_threads", arguments: { cwd: "C:\\repo" } },
+  };
+  const claim = queue.waitForClaimable({ timeoutMs: 1_000 });
+  const first = sessionMcpPost(baseUrl, message, token, sessionId);
+  const second = sessionMcpPost(baseUrl, message, token, sessionId);
+  const job = await claim;
+  assert.ok(job);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(queue.size, 1);
+
+  const result = {
+    content: [{ type: "text", text: "one execution" }],
+    structuredContent: { executions: 1 },
+    isError: false,
+  };
+  queue.complete({ jobId: job.id, leaseId: job.leaseId, result });
+  const [firstResponse, secondResponse] = await Promise.all([first, second]);
+  assert.deepEqual(firstResponse.payload.result, result);
+  assert.deepEqual(secondResponse.payload.result, result);
+  assert.equal(queue.size, 0);
+
+  const cached = await sessionMcpPost(baseUrl, message, token, sessionId);
+  assert.deepEqual(cached.payload.result, result);
+  assert.equal(queue.size, 0);
+});
+
+test("tools/call rejects reuse of an idempotency key with a different payload", async (t) => {
+  const { baseUrl, queue, sessionId, token } = await idempotencyFixture(t);
+  const original = {
+    jsonrpc: "2.0",
+    id: 78,
+    method: "tools/call",
+    params: { name: "codex_list_threads", arguments: { cwd: "C:\\one" } },
+  };
+  const claim = queue.waitForClaimable({ timeoutMs: 1_000 });
+  const pending = sessionMcpPost(baseUrl, original, token, sessionId);
+  const job = await claim;
+  const conflict = await sessionMcpPost(baseUrl, {
+    ...original,
+    params: { name: "codex_list_threads", arguments: { cwd: "C:\\two" } },
+  }, token, sessionId);
+  assert.equal(conflict.payload.error.code, -32009);
+  assert.equal(conflict.payload.error.data.type, "IdempotencyConflict");
+  assert.equal(queue.size, 1);
+
+  queue.complete({
+    jobId: job.id,
+    leaseId: job.leaseId,
+    result: { content: [], structuredContent: { ok: true }, isError: false },
+  });
+  await pending;
+  assert.equal(queue.size, 0);
+});
+
+test("numeric and string JSON-RPC ids have distinct idempotency keys", async (t) => {
+  const { baseUrl, queue, sessionId, token } = await idempotencyFixture(t);
+  const baseMessage = {
+    jsonrpc: "2.0",
+    method: "tools/call",
+    params: { name: "codex_list_threads", arguments: {} },
+  };
+  const firstClaim = queue.waitForClaimable({ timeoutMs: 1_000 });
+  const numeric = sessionMcpPost(baseUrl, { ...baseMessage, id: 88 }, token, sessionId);
+  const textual = sessionMcpPost(baseUrl, { ...baseMessage, id: "88" }, token, sessionId);
+  const firstJob = await firstClaim;
+  const secondJob = await queue.waitForClaimable({ timeoutMs: 1_000 });
+  assert.ok(firstJob);
+  assert.ok(secondJob);
+  assert.notEqual(firstJob.id, secondJob.id);
+  for (const job of [firstJob, secondJob]) {
+    queue.complete({
+      jobId: job.id,
+      leaseId: job.leaseId,
+      result: { content: [], structuredContent: { jobId: job.id }, isError: false },
+    });
+  }
+  const [numericResponse, textualResponse] = await Promise.all([numeric, textual]);
+  assert.equal(numericResponse.payload.id, 88);
+  assert.equal(textualResponse.payload.id, "88");
+});
+
+test("tools/call idempotency is partitioned by OAuth subject and MCP session", async (t) => {
+  const { baseUrl, key, identity, queue, sessionId, token } = await idempotencyFixture(t);
+  const otherToken = mintJwt({
+    issuer: identity.issuer,
+    key,
+    subject: "user-2",
+    scope: `${READ_SCOPE} ${WRITE_SCOPE}`,
+  });
+  const message = {
+    jsonrpc: "2.0",
+    id: 79,
+    method: "tools/call",
+    params: { name: "codex_list_threads", arguments: {} },
+  };
+  const otherSessionId = await initializeMcpSession(baseUrl, token);
+  const otherSubjectSessionId = await initializeMcpSession(baseUrl, otherToken);
+  const firstClaim = queue.waitForClaimable({ timeoutMs: 1_000 });
+  const calls = [
+    sessionMcpPost(baseUrl, message, token, sessionId),
+    sessionMcpPost(baseUrl, message, token, otherSessionId),
+    sessionMcpPost(baseUrl, message, otherToken, otherSubjectSessionId),
+  ];
+  const jobs = [await firstClaim];
+  jobs.push(await queue.waitForClaimable({ timeoutMs: 1_000 }));
+  jobs.push(await queue.waitForClaimable({ timeoutMs: 1_000 }));
+  assert.equal(new Set(jobs.map((job) => job.id)).size, 3);
+  for (const job of jobs) {
+    queue.complete({
+      jobId: job.id,
+      leaseId: job.leaseId,
+      result: { content: [], structuredContent: { jobId: job.id }, isError: false },
+    });
+  }
+  await Promise.all(calls);
+});
+
+test("disconnecting the last MCP waiter cancels its queued relay job", async (t) => {
+  const { baseUrl, queue, sessionId, token } = await idempotencyFixture(t);
+  const controller = new AbortController();
+  const claim = queue.waitForClaimable({ timeoutMs: 1_000 });
+  const response = fetch(`${baseUrl}/mcp`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+      "mcp-session-id": sessionId,
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 80,
+      method: "tools/call",
+      params: { name: "codex_list_threads", arguments: {} },
+    }),
+    signal: controller.signal,
+  });
+  const job = await claim;
+  controller.abort(new Error("test client disconnected"));
+  await assert.rejects(response);
+  for (let attempt = 0; attempt < 20 && queue.size !== 0; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(queue.size, 0);
+  assert.throws(
+    () => queue.complete({
+      jobId: job.id,
+      leaseId: job.leaseId,
+      result: { ok: true },
+    }),
+    /Unknown or expired job id/,
+  );
+});
+
+test("relay queue rejects pre-aborted waits without leaking waiters or jobs", async () => {
+  const queue = new RelayQueue();
+  const claimReason = new Error("claim already cancelled");
+  await assert.rejects(
+    queue.waitForClaimable({ timeoutMs: 10_000, signal: AbortSignal.abort(claimReason) }),
+    (error) => error === claimReason,
+  );
+  assert.equal(queue.waiters.length, 0);
+
+  const job = queue.enqueue({ toolName: "codex_status", arguments: {} });
+  const resultReason = new Error("result already cancelled");
+  await assert.rejects(
+    queue.waitForResult(job, {
+      timeoutMs: 10_000,
+      signal: AbortSignal.abort(resultReason),
+    }),
+    (error) => error === resultReason,
+  );
+  assert.equal(queue.size, 0);
+  assert.equal(queue.claim(), null);
+});
+
+test("aborting a result wait cancels claimed work and rejects late completion", async () => {
+  const queue = new RelayQueue();
+  const job = queue.enqueue({ toolName: "codex_status", arguments: {} });
+  const claimed = queue.claim();
+  const controller = new AbortController();
+  const waiting = queue.waitForResult(job, {
+    timeoutMs: 10_000,
+    signal: controller.signal,
+  });
+  const reason = new Error("client disconnected");
+  controller.abort(reason);
+  await assert.rejects(waiting, (error) => error === reason);
+  assert.equal(queue.size, 0);
+  assert.throws(
+    () => queue.complete({
+      jobId: claimed.id,
+      leaseId: claimed.leaseId,
+      result: { ok: true },
+    }),
+    /Unknown or expired job id/,
+  );
+});
+
+test("an already-completed relay result wins an abort race", async () => {
+  const queue = new RelayQueue();
+  const job = queue.enqueue({ toolName: "codex_status", arguments: {} });
+  const claimed = queue.claim();
+  const controller = new AbortController();
+  const waiting = queue.waitForResult(job, {
+    timeoutMs: 10_000,
+    signal: controller.signal,
+  });
+  queue.complete({ jobId: claimed.id, leaseId: claimed.leaseId, result: { ok: true } });
+  controller.abort(new Error("too late"));
+  assert.deepEqual(await waiting, { result: { ok: true } });
+});
+
 test("relay queue leases jobs, rejects stale duplicate submissions, and accepts current result", () => {
   let now = 1_000;
   const queue = new RelayQueue({
@@ -1068,6 +1479,7 @@ test("relay result submission completes a pending MCP read tool call through a m
   const idp = await withIdentityProvider(t, { keys: [key] });
   const baseUrl = await withRelay(t, { issuer: idp.issuer });
   const token = mintJwt({ issuer: idp.issuer, key, scope: READ_SCOPE });
+  const sessionId = await initializeMcpSession(baseUrl, token);
   const mcpCall = oauthPost(
     baseUrl,
     "/mcp",
@@ -1081,6 +1493,7 @@ test("relay result submission completes a pending MCP read tool call through a m
       },
     },
     token,
+    { "mcp-session-id": sessionId },
   );
 
   const claimResponse = await agentSignedPost(baseUrl, "/agent/jobs/claim", { maxWaitMs: 100 });
@@ -1118,6 +1531,7 @@ test("legacy result submissions obey the configured result limit and payload sha
     },
   });
   const token = mintJwt({ issuer: idp.issuer, key, scope: READ_SCOPE });
+  const sessionId = await initializeMcpSession(baseUrl, token);
   const mcpCall = oauthPost(
     baseUrl,
     "/mcp",
@@ -1128,6 +1542,7 @@ test("legacy result submissions obey the configured result limit and payload sha
       params: { name: "codex_list_threads", arguments: {} },
     },
     token,
+    { "mcp-session-id": sessionId },
   );
   const claim = await (await agentSignedPost(
     baseUrl,
@@ -1166,6 +1581,7 @@ test("relay reconstructs a large opaque multi-chunk result without plaintext on 
   const idp = await withIdentityProvider(t, { keys: [key] });
   const baseUrl = await withRelay(t, { issuer: idp.issuer });
   const token = mintJwt({ issuer: idp.issuer, key, scope: READ_SCOPE });
+  const sessionId = await initializeMcpSession(baseUrl, token);
   const mcpCall = oauthPost(
     baseUrl,
     "/mcp",
@@ -1179,6 +1595,7 @@ test("relay reconstructs a large opaque multi-chunk result without plaintext on 
       },
     },
     token,
+    { "mcp-session-id": sessionId },
   );
 
   const claimResponse = await agentSignedPost(baseUrl, "/agent/jobs/claim", { maxWaitMs: 100 });
@@ -1267,4 +1684,103 @@ test("relay rejects chunk uploads for a stale lease before buffering", async (t)
   });
   assert.equal(response.status, 409);
   assert.match((await response.json()).message, /lease is not current/);
+});
+
+test("relay sanitizes nested local-agent errors before returning an MCP result", async (t) => {
+  const key = createRsaKey("nested-error-kid");
+  const idp = await withIdentityProvider(t, { keys: [key] });
+  const baseUrl = await withRelay(t, { issuer: idp.issuer });
+  const token = mintJwt({ issuer: idp.issuer, key, scope: READ_SCOPE });
+  const initialized = await sessionMcpPost(baseUrl, {
+    jsonrpc: "2.0",
+    id: "initialize-nested-error",
+    method: "initialize",
+    params: { protocolVersion: "2025-11-25" },
+  }, token);
+  const sessionId = initialized.response.headers.get("mcp-session-id");
+
+  const mcpCall = sessionMcpPost(baseUrl, {
+    jsonrpc: "2.0",
+    id: "nested-error-call",
+    method: "tools/call",
+    params: { name: "codex_status", arguments: { threadId: "thread-1" } },
+  }, token, sessionId);
+  const claimResponse = await agentSignedPost(baseUrl, "/agent/jobs/claim", {
+    maxWaitMs: 100,
+  });
+  assert.equal(claimResponse.status, 200);
+  const { job } = await claimResponse.json();
+
+  const sentinel = ["nested", "appserver", "secret"].join("-");
+  const resultResponse = await agentSignedPost(baseUrl, "/agent/jobs/result", {
+    jobId: job.id,
+    leaseId: job.leaseId,
+    error: {
+      type: "AppServerError",
+      message: `BIOTELE_RELAY_AGENT_SECRET=${sentinel}`,
+      data: {
+        BIOTELE_RELAY_AGENT_SECRET: sentinel,
+        "x-api-key": sentinel,
+        nested: { password: sentinel },
+        tokenCount: 4,
+      },
+    },
+  });
+  assert.equal(resultResponse.status, 202);
+
+  const completed = await mcpCall;
+  assert.equal(completed.response.status, 200);
+  const serialized = JSON.stringify(completed.payload);
+  assert.doesNotMatch(serialized, new RegExp(sentinel));
+  assert.match(serialized, /\[REDACTED\]/);
+  const returnedError = completed.payload.result.structuredContent.error;
+  assert.equal(returnedError.data.BIOTELE_RELAY_AGENT_SECRET, "[REDACTED]");
+  assert.equal(returnedError.data["x-api-key"], "[REDACTED]");
+  assert.equal(returnedError.data.nested.password, "[REDACTED]");
+  assert.equal(returnedError.data.tokenCount, 4);
+});
+
+test("relay bounds and sanitizes user-controlled JSON-RPC error messages", async (t) => {
+  const key = createRsaKey("rpc-error-kid");
+  const idp = await withIdentityProvider(t, { keys: [key] });
+  const baseUrl = await withRelay(t, { issuer: idp.issuer });
+  const token = mintJwt({ issuer: idp.issuer, key, scope: READ_SCOPE });
+  const sessionId = await initializeMcpSession(baseUrl, token);
+  const sentinel = ["rpc", "message", "secret"].join("-");
+
+  const outcome = await sessionMcpPost(baseUrl, {
+    jsonrpc: "2.0",
+    id: "sanitized-rpc-error",
+    method: `unknown_BIOTELE_RELAY_AGENT_SECRET=${sentinel}_${"x".repeat(10_000)}`,
+  }, token, sessionId);
+
+  assert.equal(outcome.response.status, 200);
+  assert.equal(outcome.payload.error.code, -32601);
+  assert.doesNotMatch(outcome.payload.error.message, new RegExp(sentinel));
+  assert.match(outcome.payload.error.message, /\[REDACTED\]/);
+  assert.ok(Buffer.byteLength(outcome.payload.error.message, "utf8") <= 2 * 1024);
+});
+
+test("relay sanitizes initialization failures across readiness and logs", async (t) => {
+  const sentinel = ["initialization", "secret", "sentinel"].join("-");
+  const logs = [];
+  const { server, baseUrl } = await withRawRelay(t, {
+    env: validEnv(),
+    logger: { write() {} },
+    errorLogger: { write(message) { logs.push(message); } },
+    initializeBlocker: async () => {
+      const error = new Error(`BIOTELE_RELAY_AGENT_SECRET=${sentinel}\nforged-line`);
+      error.name = `x-api-key=${sentinel}`;
+      throw error;
+    },
+  });
+
+  const readiness = await server.initialize();
+  assert.equal(readiness.status, "failed");
+  const readyResponse = await fetch(`${baseUrl}/readyz`);
+  assert.equal(readyResponse.status, 503);
+  const publicAndLogged = `${JSON.stringify(await readyResponse.json())}\n${logs.join("")}`;
+  assert.doesNotMatch(publicAndLogged, new RegExp(sentinel));
+  assert.match(publicAndLogged, /\[REDACTED\]/);
+  assert.doesNotMatch(logs.join(""), /\nforged-line/);
 });

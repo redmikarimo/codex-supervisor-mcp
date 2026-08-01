@@ -111,3 +111,35 @@ test("AppServerClient rejects shell shims and keeps native executables", () => {
   assert.equal(assertSafeAppServerCommand("codex"), "codex");
   assert.equal(assertSafeAppServerCommand(process.execPath), process.execPath);
 });
+
+test("AppServerClient turns an unexpected process exit into thread-scoped terminal state", async (t) => {
+  const eventStore = new EventStore();
+  eventStore.recordTurnStart("thread-active", { id: "turn-active" });
+  eventStore.addPendingRequest({
+    id: "approval-active",
+    method: "item/fileChange/requestApproval",
+    params: { threadId: "thread-active", turnId: "turn-active" },
+  });
+
+  const client = new AppServerClient({
+    command: process.execPath,
+    args: ["-e", "setTimeout(() => process.exit(7), 20)"],
+    eventStore,
+    requestTimeoutMs: 1_000,
+  });
+  t.after(async () => {
+    await client.stop();
+  });
+
+  await assert.rejects(
+    () => client.request("thread/read", { threadId: "thread-active" }),
+    /exited unexpectedly/,
+  );
+
+  const failed = eventStore.getSnapshot("thread-active");
+  assert.equal(failed.activeTurnId, null);
+  assert.equal(failed.latestError.source, "app-server-process");
+  assert.equal(failed.events.filter((event) => event.method === "error").length, 1);
+  assert.deepEqual(failed.pendingRequests, []);
+  assert.equal(eventStore.getSnapshot("thread-unrelated").latestError, null);
+});

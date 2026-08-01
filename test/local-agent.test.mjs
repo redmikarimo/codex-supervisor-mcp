@@ -12,6 +12,7 @@ import {
   RESULT_SUBMISSION_PROTOCOL,
   ResultSubmissionAssembler,
 } from "../src/relay-result-protocol.mjs";
+import { AppServerError } from "../src/errors.mjs";
 
 const CAPABILITY = {
   preferredProtocol: RESULT_SUBMISSION_PROTOCOL,
@@ -42,6 +43,56 @@ test("local agent accepts empty success and rejects invalid success JSON", async
     () => parseRelayResponse(new Response("not-json", { status: 200 }), "/agent/status"),
     /returned non-JSON data with HTTP 200/,
   );
+});
+
+test("local agent sanitizes AppServerError fields and structured data", async () => {
+  const sentinel = ["app", "server", "secret"].join("-");
+  const submissions = [];
+  const agent = new LocalRelayAgent({
+    service: { async close() {} },
+    tools: {
+      has() {
+        return true;
+      },
+      async call() {
+        throw new AppServerError(`BIOTELE_RELAY_AGENT_SECRET=${sentinel}`, {
+          code: `token=${sentinel}`,
+          method: `authorization=Bearer ${sentinel}`,
+          data: {
+            BIOTELE_RELAY_AGENT_SECRET: sentinel,
+            "x-api-key": sentinel,
+            nested: { password: sentinel },
+            tokenCount: 3,
+          },
+        });
+      },
+    },
+    pathPolicy: { async resolveCwd() {} },
+    submit: async (_job, payload) => {
+      submissions.push(payload);
+    },
+  });
+
+  await agent.handleJob({
+    id: "app-server-error-sanitization",
+    leaseId: "app-server-error-sanitization-lease",
+    deliveryCount: 1,
+    toolName: "codex_status",
+    arguments: {},
+  });
+
+  assert.equal(submissions.length, 1);
+  const result = submissions[0].result;
+  const serialized = JSON.stringify(result);
+  assert.equal(result.isError, true);
+  assert.doesNotMatch(serialized, new RegExp(sentinel));
+  assert.match(serialized, /\[REDACTED\]/);
+  assert.equal(result.structuredContent.error.data.tokenCount, 3);
+  assert.equal(
+    result.structuredContent.error.data.BIOTELE_RELAY_AGENT_SECRET,
+    "[REDACTED]",
+  );
+  assert.equal(result.structuredContent.error.data["x-api-key"], "[REDACTED]");
 });
 
 test("result capability negotiation derives limits from the final clamped values", () => {
@@ -272,6 +323,91 @@ for (const resultBudgetMs of [0, 1, 2_000]) {
     assert.equal(resultRequests, 0);
   });
 }
+
+test("local agent stop aborts a pending poll and closes the service exactly once", async () => {
+  let closeCount = 0;
+  let pollStarted;
+  const started = new Promise((resolve) => {
+    pollStarted = resolve;
+  });
+  const agent = new LocalRelayAgent({
+    service: {
+      async close() {
+        closeCount += 1;
+      },
+    },
+    tools: {},
+    pathPolicy: {},
+    request: async (_path, _body, _timeoutMs, { signal }) => {
+      pollStarted();
+      return await new Promise((resolve, reject) => {
+        const onAbort = () => reject(signal.reason);
+        signal.addEventListener("abort", onAbort, { once: true });
+        if (signal.aborted) {
+          onAbort();
+        }
+      });
+    },
+  });
+
+  const running = agent.run();
+  await started;
+  await agent.stop();
+  await running;
+  await agent.stop();
+  assert.equal(closeCount, 1);
+  assert.equal(agent.activeJobs.size, 0);
+});
+
+test("local agent stop waits for active job submission before closing the service", async () => {
+  const events = [];
+  let releaseTool;
+  let toolStarted;
+  const started = new Promise((resolve) => {
+    toolStarted = resolve;
+  });
+  const gate = new Promise((resolve) => {
+    releaseTool = resolve;
+  });
+  const agent = new LocalRelayAgent({
+    service: {
+      async close() {
+        events.push("close");
+      },
+    },
+    tools: {
+      has() {
+        return true;
+      },
+      async call() {
+        events.push("tool-start");
+        toolStarted();
+        await gate;
+        events.push("tool-finish");
+        return { ok: true };
+      },
+    },
+    pathPolicy: { async resolveCwd() {} },
+    submit: async () => {
+      events.push("submit");
+    },
+  });
+  const handling = agent.handleJob({
+    id: "active-job",
+    leaseId: "active-lease",
+    deliveryCount: 1,
+    toolName: "codex_status",
+    arguments: {},
+  }, {});
+  await started;
+  const stopping = agent.stop();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, ["tool-start"]);
+  releaseTool();
+  await Promise.all([handling, stopping]);
+  assert.deepEqual(events, ["tool-start", "tool-finish", "submit", "close"]);
+  assert.equal(agent.activeJobs.size, 0);
+});
 
 test("chunk submission adapts after HTTP 413 and legacy fallback stays one-shot", async () => {
   const uploadIds = new Set();

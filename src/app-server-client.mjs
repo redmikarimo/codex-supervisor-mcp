@@ -86,6 +86,7 @@ export class AppServerClient {
     this.startPromise = null;
     this.nextRequestId = 1;
     this.pending = new Map();
+    this.resolvingRequests = new Set();
     this.stderrLines = [];
     this.loadedThreads = new Set();
   }
@@ -117,21 +118,39 @@ export class AppServerClient {
     });
     this.child = child;
 
-    child.on("error", (error) => {
-      this.state = "failed";
+    let failureHandled = false;
+    const handleUnexpectedFailure = (error) => {
+      if (failureHandled) {
+        return;
+      }
+      failureHandled = true;
+      this.loadedThreads.clear();
+      this.eventStore.recordProcessFailure(error);
       this.#rejectAll(error);
+    };
+
+    child.on("error", (error) => {
+      const wasStopping = this.state === "stopping" || this.state === "stopped";
+      if (wasStopping) {
+        return;
+      }
+      this.state = "failed";
+      handleUnexpectedFailure(error);
     });
 
     child.on("exit", (code, signal) => {
       const wasStopping = this.state === "stopping" || this.state === "stopped";
       this.state = "stopped";
       this.loadedThreads.clear();
+      if (this.child === child) {
+        this.child = null;
+      }
 
       if (!wasStopping) {
         const error = new AppServerError(
           processFailureMessage(code, signal),
         );
-        this.#rejectAll(error);
+        handleUnexpectedFailure(error);
       }
     });
 
@@ -195,8 +214,12 @@ export class AppServerClient {
       await this.#write({ method: "initialized", params: {} });
       this.state = "ready";
     } catch (error) {
-      this.state = "failed";
-      child.kill();
+      const alreadyExited =
+        this.child !== child || child.exitCode !== null || child.signalCode !== null;
+      this.state = alreadyExited ? "stopped" : "failed";
+      if (!alreadyExited) {
+        child.kill();
+      }
       throw error;
     }
   }
@@ -225,17 +248,28 @@ export class AppServerClient {
 
   async resolveServerRequest(requestKey, result) {
     await this.start();
-    const request = this.eventStore.getPendingRequest(requestKey);
-    if (!request) {
-      throw new AppServerError(`No pending Codex server request exists for requestKey "${requestKey}".`);
+    if (this.resolvingRequests.has(requestKey)) {
+      throw new AppServerError(
+        `Codex server request "${requestKey}" is already being resolved.`,
+      );
     }
 
-    await this.#write({
-      id: request.requestId,
-      result,
-    });
-    this.eventStore.removePendingRequest(requestKey);
-    return request;
+    this.resolvingRequests.add(requestKey);
+    try {
+      const request = this.eventStore.getPendingRequest(requestKey);
+      if (!request) {
+        throw new AppServerError(`No pending Codex server request exists for requestKey "${requestKey}".`);
+      }
+
+      await this.#write({
+        id: request.requestId,
+        result,
+      });
+      this.eventStore.removePendingRequest(requestKey);
+      return request;
+    } finally {
+      this.resolvingRequests.delete(requestKey);
+    }
   }
 
   async stop() {

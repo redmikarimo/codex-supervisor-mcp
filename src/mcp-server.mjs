@@ -1,18 +1,14 @@
 import readline from "node:readline";
 
+import { sanitizeErrorData, sanitizeErrorText } from "./error-sanitization.mjs";
 import { AppServerError, SecurityError, ValidationError } from "./errors.mjs";
 
 const SERVER_NAME = "codex-supervisor-mcp";
 const SERVER_TITLE = "Codex Supervisor MCP";
-const SERVER_VERSION = "1.0.0";
+const SERVER_VERSION = "1.2.4";
 const MODERN_PROTOCOL_VERSION = "2026-07-28";
 const LATEST_LEGACY_PROTOCOL_VERSION = "2025-11-25";
-const LEGACY_PROTOCOL_VERSIONS = new Set([
-  "2025-11-25",
-  "2025-06-18",
-  "2025-03-26",
-  "2024-11-05",
-]);
+const LEGACY_PROTOCOL_VERSIONS = new Set([LATEST_LEGACY_PROTOCOL_VERSION]);
 const SUPPORTED_PROTOCOL_VERSIONS = [
   MODERN_PROTOCOL_VERSION,
   LATEST_LEGACY_PROTOCOL_VERSION,
@@ -37,9 +33,9 @@ function modernProtocolVersion(message) {
 }
 
 function jsonRpcError(id, code, message, data = undefined) {
-  const error = { code, message };
+  const error = { code, message: sanitizeErrorText(message) };
   if (data !== undefined) {
-    error.data = data;
+    error.data = sanitizeErrorData(data);
   }
   return {
     jsonrpc: "2.0",
@@ -61,13 +57,13 @@ function completeToolResult(output, isModern, isError = false) {
 function toolErrorResult(error, isModern) {
   const output = {
     error: {
-      type: error?.name || "Error",
-      message: error?.message || String(error),
+      type: sanitizeErrorText(error?.name || "Error", 128),
+      message: sanitizeErrorText(error?.message || String(error)),
       ...(error instanceof AppServerError
         ? {
-            code: error.code ?? null,
-            method: error.method ?? null,
-            data: error.data ?? null,
+            code: sanitizeErrorData(error.code ?? null),
+            method: sanitizeErrorText(error.method ?? "", 256) || null,
+            data: sanitizeErrorData(error.data ?? null),
           }
         : {}),
     },
@@ -85,6 +81,7 @@ export class McpStdioServer {
     this.legacyNegotiated = false;
     this.legacyReady = false;
     this.inFlight = new Map();
+    this.activeRequestIds = new Set();
     this.closed = false;
     this.writeChain = Promise.resolve();
   }
@@ -116,6 +113,7 @@ export class McpStdioServer {
       controller.abort();
     }
     this.inFlight.clear();
+    this.activeRequestIds.clear();
     await this.service.close();
   }
 
@@ -168,6 +166,23 @@ export class McpStdioServer {
   }
 
   async #handleRequest(message) {
+    const key = requestKey(message.id);
+    if (this.activeRequestIds.has(key)) {
+      await this.#send(
+        jsonRpcError(message.id, -32600, "Duplicate active JSON-RPC request id."),
+      );
+      return;
+    }
+
+    this.activeRequestIds.add(key);
+    try {
+      await this.#dispatchRequest(message);
+    } finally {
+      this.activeRequestIds.delete(key);
+    }
+  }
+
+  async #dispatchRequest(message) {
     const { id, method } = message;
     const requestedVersion = modernProtocolVersion(message);
     const isModern = requestedVersion !== null;
