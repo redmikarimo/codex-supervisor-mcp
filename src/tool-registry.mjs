@@ -269,7 +269,11 @@ export const TOOL_DEFINITIONS = [
       additionalProperties: false,
       properties: {
         threadId: { type: "string", description: "Codex thread id." },
-        includeTurns: { type: "boolean", default: true },
+        includeTurns: {
+          type: "boolean",
+          default: false,
+          description: "Include full persisted turns. Omit for the safer compact thread view.",
+        },
       },
       required: ["threadId"],
     },
@@ -472,7 +476,7 @@ export function createToolRegistry(service) {
       assertAllowedKeys(input, ["threadId", "includeTurns"]);
       return await service.readThread({
         threadId: threadId(input.threadId),
-        includeTurns: optionalBoolean(input.includeTurns, "includeTurns", true),
+        includeTurns: optionalBoolean(input.includeTurns, "includeTurns", false),
       });
     },
 

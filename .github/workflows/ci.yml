@@ -31,3 +31,69 @@ jobs:
 
       - name: Run tests
         run: npm test
+
+  windows-installer:
+    name: Windows installer
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Parse and exercise native Codex discovery
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path './scripts/install-local-agent.ps1'),
+            [ref]$tokens,
+            [ref]$errors
+          )
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_.Message }
+            exit 1
+          }
+
+          $wanted = @(
+            'Assert-NativeCodexPath'
+            'Resolve-NativeCodex'
+            'Resolve-AllowedRoots'
+          )
+          $definitions = $ast.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+              $wanted -contains $node.Name
+          }, $true)
+          foreach ($definition in $definitions) {
+            Invoke-Expression $definition.Extent.Text
+          }
+          if ($definitions.Count -ne $wanted.Count) {
+            throw 'Installer discovery functions were not found.'
+          }
+
+          $fixture = Join-Path $env:RUNNER_TEMP 'codex-discovery-fixture'
+          $env:APPDATA = $fixture
+          $env:LOCALAPPDATA = $fixture
+          [Environment]::SetEnvironmentVariable('CODEX_BIN', $null, 'User')
+          $native = Join-Path $fixture 'npm\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe'
+          New-Item -ItemType Directory -Path (Split-Path -Parent $native) -Force | Out-Null
+          New-Item -ItemType File -Path $native -Force | Out-Null
+          $resolved = Resolve-NativeCodex -SkipCommandDiscovery
+          if ($resolved -ne (Resolve-Path -LiteralPath $native).ProviderPath) {
+            throw "Sibling npm native Codex layout was not discovered: $resolved"
+          }
+
+          $allowed = Join-Path $fixture 'allowed-root'
+          New-Item -ItemType Directory -Path $allowed -Force | Out-Null
+          if ((Resolve-AllowedRoots -Value $allowed) -ne (Resolve-Path $allowed).ProviderPath) {
+            throw 'Allowed root was not canonicalized.'
+          }
+          try {
+            Resolve-AllowedRoots -Value ' '
+            throw 'Blank AllowedRoots was accepted.'
+          } catch {
+            if ($_.Exception.Message -eq 'Blank AllowedRoots was accepted.') {
+              throw
+            }
+          }

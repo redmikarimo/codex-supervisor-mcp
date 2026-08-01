@@ -182,6 +182,16 @@ test("MCP server starts, monitors, and approves Codex tasks", async (t) => {
   const completed = completedResult.structuredContent;
   assert.equal(completed.reason, "completed");
   assert.match(completed.latestAgentMessage, /Completed: create a normal mock change/);
+  assert.deepEqual(Object.keys(completed.appServer).sort(), [
+    "loadedThreadCount",
+    "pid",
+    "state",
+    "stderrLineCount",
+  ]);
+  assert.equal("command" in completed.appServer, false);
+  assert.equal("args" in completed.appServer, false);
+  assert.equal("loadedThreadIds" in completed.appServer, false);
+  assert.equal("stderrTail" in completed.appServer, false);
 
   const sentResult = await client.request("tools/call", {
     name: "codex_send",

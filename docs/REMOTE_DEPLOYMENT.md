@@ -101,6 +101,7 @@ PORT=<provided by Hostinger, or 3000 if hPanel asks for one>
 BIOTELE_RELAY_AGENT_KEY_ID=windows-agent-1
 BIOTELE_RELAY_AGENT_SECRET=<different 32+ byte agent secret>
 BIOTELE_RELAY_PUBLIC_URL=https://mcp.biotele.mx
+BIOTELE_RELAY_TRUST_PROXY=true
 BIOTELE_RELAY_OAUTH_REQUIRED=true
 BIOTELE_RELAY_OAUTH_ISSUER=<issuer URL from Auth0 or Entra ID>
 BIOTELE_RELAY_OAUTH_AUDIENCE=https://mcp.biotele.mx/mcp
@@ -109,7 +110,9 @@ BIOTELE_RELAY_OAUTH_CLOCK_SKEW_SECONDS=60
 BIOTELE_RELAY_OAUTH_READ_SCOPE=biotele.mcp.read
 BIOTELE_RELAY_OAUTH_WRITE_SCOPE=biotele.mcp.write
 BIOTELE_RELAY_MAX_BODY_BYTES=262144
+BIOTELE_RELAY_MAX_RESULT_BYTES=2097152
 BIOTELE_RELAY_RATE_LIMIT_PER_MINUTE=120
+BIOTELE_RELAY_RESULT_RATE_LIMIT_PER_MINUTE=600
 BIOTELE_RELAY_MCP_WAIT_MS=55000
 BIOTELE_RELAY_AGENT_POLL_MS=25000
 BIOTELE_RELAY_JOB_TTL_MS=120000
@@ -134,6 +137,11 @@ If hPanel retains only `BIOTELE_RELAY_AGENT_KEYS`, set that variable to the raw
 canonical Base64 agent secret with no JSON, quotes, braces, or backslashes. The
 relay then uses `windows-agent-1` as the key ID. This single-secret format must
 decode to at least 32 bytes and is intended for one Hostinger-connected agent.
+`BIOTELE_RELAY_TRUST_PROXY=true` is appropriate only while the app is reachable
+through Hostinger's managed reverse proxy and the direct origin is not publicly
+reachable. The relay then uses the nearest proxy-supplied `X-Forwarded-For`
+address for pre-authentication failure buckets, preventing one anonymous client
+from poisoning the valid Windows agent's shared proxy-socket bucket.
 
 ## Relay Health Monitoring
 
@@ -168,22 +176,28 @@ npm install
 .\scripts\install-local-agent.ps1 `
   -RelayBaseUrl 'https://mcp.biotele.mx' `
   -AgentKeyId 'windows-agent-1' `
-  -AllowedRoots 'C:\Users\Red Mex\Documents\codex-supervisor-mcp' `
+  -AllowedRoots 'C:\Users\Red Mex\Documents\codex-supervisor-mcp;C:\Users\Red Mex\Desktop\VitalsScan-Codex-Handoff' `
   -RegisterScheduledTask
 ```
 
-The installer prompts for the agent HMAC secret without echoing it, stores local
-agent settings in the current user's environment, and optionally registers a
-least-privilege logon scheduled task. It does not put the secret in the task
-command. If Windows denies scheduled-task registration, rerun the installer
-from an Administrator PowerShell. The registered task still uses the `Limited`
-run level. It starts when available and restarts up to three times at one-minute
-intervals if the local-agent process exits.
+The installer reuses a valid stored HMAC secret or prompts without echoing it,
+discovers and persists the native `codex.exe`, preserves stored allowed roots
+when `-AllowedRoots` is omitted, and optionally registers a least-privilege
+logon scheduled task. It rejects `.cmd`, `.bat`, and `.ps1` Codex shims and does
+not execute an auto-discovered binary during installation. It does not put the
+secret in the task command. If Windows denies scheduled-task registration,
+rerun the installer from an Administrator PowerShell. The registered task still
+uses the `Limited` run level, is scoped to the current qualified Windows
+identity, runs without the default 72-hour execution cutoff, and is allowed to
+continue on battery power. It starts when available and restarts up to three
+times at one-minute intervals if the local-agent process exits. Allowed roots
+must already exist; blank or non-filesystem roots are rejected before settings
+are written.
 
 Manual start:
 
 ```powershell
-npm run start:local-agent
+node .\src\local-agent.mjs
 ```
 
 Scheduled task operations:
@@ -191,6 +205,7 @@ Scheduled task operations:
 ```powershell
 Start-ScheduledTask -TaskName 'Biotele Codex MCP Local Agent'
 Get-ScheduledTask -TaskName 'Biotele Codex MCP Local Agent'
+Get-ScheduledTaskInfo -TaskName 'Biotele Codex MCP Local Agent'
 Unregister-ScheduledTask -TaskName 'Biotele Codex MCP Local Agent'
 ```
 
@@ -291,6 +306,27 @@ return structured JSON-RPC error objects where possible. Tool calls are held for
 at most `BIOTELE_RELAY_MCP_WAIT_MS`; if the local agent does not finish in that
 request window, the result is an MCP tool error indicating timeout. For long
 Codex work, call `codex_start`, then poll with `codex_wait` or `codex_status`.
+`codex_read_thread` omits full turns by default; request `includeTurns=true`
+only when the larger persisted history is required.
+
+The relay advertises `base64url-json-chunked-v1` to updated agents. Each result
+is serialized once, SHA-256 hashed, split into bounded chunks, and carried in
+the existing HMAC-signed `/agent/jobs/result` requests. The relay verifies the
+current job lease before buffering, rejects conflicting or out-of-order chunks,
+checks the final byte length and digest, and only then parses the JSON result.
+Transient chunk failures retry immediately with the same upload identifier, and
+an unexpected HTTP 413 causes a smaller fresh upload. Confirmed local results
+are removed from the retry cache; ambiguous failures remain in a byte- and
+entry-bounded cache. Legacy one-shot submissions remain accepted for staged
+upgrades and obey the same result-size and payload-shape policy. Base64url is
+transport encoding, not encryption; decoded results still exist briefly in
+relay memory and in the authenticated MCP response. Chunk traffic has its own
+authenticated rate budget so near-limit results do not consume the control-call
+budget. Failed authentication and malformed result requests remain subject to
+the smaller control-call budget before the larger authenticated budget applies.
+The relay sends a relative result budget with each claim; the agent anchors it
+to its own clock so ordinary Hostinger/Windows clock skew cannot invalidate a
+fresh lease.
 
 ## Threat Model
 
@@ -312,8 +348,19 @@ Primary mitigations:
 - Timestamp, nonce, and expiry checks reject replayed or stale requests.
 - Jobs are in memory only and short-lived; sensitive payloads are not persisted
   at rest by the relay.
-- The queue uses job leases so stale duplicate result submissions are rejected.
+- The queue binds leases to the authenticated agent identity, rejects elapsed
+  leases, and requires the lease window to be at least the MCP request window.
+- A replay-sensitive write re-delivered without a cached outcome fails closed
+  instead of running `codex_start`, `codex_send`, `codex_steer`, or approval
+  resolution twice; `codex_interrupt` is covered too because an omitted turn ID
+  would otherwise target whichever turn is active during replay. A new
+  replay-sensitive operation is also refused when too little result budget
+  remains to execute it and report the outcome safely.
+- Result uploads are opaque to intermediary content filters and bounded by
+  per-result, per-chunk, aggregate-memory, and expiry limits.
 - The local-agent validates every requested `cwd` against `CODEX_ALLOWED_ROOTS`.
+- The spawned Codex process does not inherit `BIOTELE_*` or `CODEX_REMOTE_*`
+  credentials.
 - Network access is disabled by default and `danger-full-access` is not
   supported.
 - Logs redact common token, key, secret, and bearer patterns.
@@ -325,7 +372,14 @@ Remaining risks:
 - A compromised Hostinger environment can enqueue malicious but still
   policy-checked work for the local-agent.
 - A compromised local Windows user environment can leak the agent secret.
-- In-memory jobs are lost when Hostinger restarts; clients should retry safely.
+- Environment stripping prevents accidental child inheritance, but Codex runs
+  under the same Windows account. It can still read user-scoped settings if it
+  is explicitly directed to do so. Use a dedicated Windows account when the
+  child process must be isolated from relay credentials.
+- In-memory jobs are lost when Hostinger restarts. A client retry creates a new
+  operation and can repeat a write that finished just before the restart; check
+  thread/turn state before retrying `codex_start`, `codex_send`, or
+  `codex_steer`.
 - A misconfigured identity provider can issue overly broad write-capable
   tokens.
 
@@ -409,8 +463,14 @@ Run the full test suite before deployment:
 npm test
 ```
 
+For v1.2.3, deploy and verify the Hostinger relay first. Then run the Windows
+installer and restart the scheduled task. This order is rollback-safe because
+the new relay accepts both result formats and the new agent uses chunking only
+when the relay advertises it.
+
 Relay tests cover authentication, expiry, replay rejection, queue lifecycle,
 timeout, duplicate delivery lease rejection, OAuth token validation, scope
 authorization, protected-resource metadata, boundary rejection between OAuth and
 agent HMAC, synthetic monitor test alerts, result submission, local-agent task
-restart settings, and a mocked local-agent integration.
+restart settings, native Codex discovery, child-secret isolation, chunked large
+results, and a mocked local-agent integration.

@@ -34,7 +34,12 @@ export class RelayQueue {
     return this.jobs.size;
   }
 
-  enqueue({ toolName, arguments: args, requestId = randomUUID() }) {
+  enqueue({
+    toolName,
+    arguments: args,
+    requestId = randomUUID(),
+    resultTimeoutMs = undefined,
+  }) {
     this.#reap();
     if (this.jobs.size >= this.maxQueuedJobs) {
       throw new Error("Relay job queue is full.");
@@ -50,6 +55,10 @@ export class RelayQueue {
       state: "queued",
       createdAt: now,
       expiresAt: now + this.jobTtlMs,
+      resultDeadlineAt:
+        Number.isSafeInteger(resultTimeoutMs) && resultTimeoutMs > 0
+          ? Math.min(now + this.jobTtlMs, now + resultTimeoutMs)
+          : now + this.jobTtlMs,
       deliveryCount: 0,
       leaseId: null,
       leasedUntil: 0,
@@ -60,7 +69,7 @@ export class RelayQueue {
     return job;
   }
 
-  claim() {
+  claim({ leaseOwner = undefined } = {}) {
     this.#reap();
     const now = this.now();
     for (const job of this.jobs.values()) {
@@ -73,7 +82,12 @@ export class RelayQueue {
       job.state = "claimed";
       job.deliveryCount += 1;
       job.leaseId = shortId();
+      job.leaseOwner = leaseOwner;
       job.leasedUntil = now + this.leaseMs;
+      const resultBudgetMs = Math.max(
+        0,
+        Math.min(job.expiresAt, job.leasedUntil, job.resultDeadlineAt) - now,
+      );
       return {
         id: job.id,
         leaseId: job.leaseId,
@@ -81,20 +95,23 @@ export class RelayQueue {
         toolName: job.toolName,
         arguments: job.arguments,
         expiresAt: job.expiresAt,
+        leasedUntil: job.leasedUntil,
+        resultDeadlineAt: job.resultDeadlineAt ?? job.expiresAt,
+        resultBudgetMs,
         deliveryCount: job.deliveryCount,
       };
     }
     return null;
   }
 
-  async waitForClaimable({ timeoutMs = 25_000, signal = undefined } = {}) {
-    const immediate = this.claim();
+  async waitForClaimable({ timeoutMs = 25_000, signal = undefined, leaseOwner = undefined } = {}) {
+    const immediate = this.claim({ leaseOwner });
     if (immediate) {
       return immediate;
     }
 
     return await new Promise((resolve, reject) => {
-      const waiter = { resolve, reject };
+      const waiter = { resolve, reject, leaseOwner };
       const cleanup = () => {
         clearTimeout(timer);
         signal?.removeEventListener("abort", onAbort);
@@ -118,15 +135,8 @@ export class RelayQueue {
     });
   }
 
-  complete({ jobId, leaseId, result = undefined, error = undefined }) {
-    this.#reap();
-    const job = this.jobs.get(jobId);
-    if (!job) {
-      throw new Error("Unknown or expired job id.");
-    }
-    if (job.state !== "claimed" || job.leaseId !== leaseId) {
-      throw new Error("Job lease is not current.");
-    }
+  complete({ jobId, leaseId, leaseOwner = undefined, result = undefined, error = undefined }) {
+    const job = this.assertCurrentLease({ jobId, leaseId, leaseOwner });
 
     this.jobs.delete(jobId);
     if (error !== undefined) {
@@ -136,7 +146,26 @@ export class RelayQueue {
     }
   }
 
+  assertCurrentLease({ jobId, leaseId, leaseOwner = undefined }) {
+    this.#reap();
+    const job = this.jobs.get(jobId);
+    if (!job) {
+      throw new Error("Unknown or expired job id.");
+    }
+    if (job.state !== "claimed" || job.leaseId !== leaseId) {
+      throw new Error("Job lease is not current.");
+    }
+    if (job.leasedUntil <= this.now()) {
+      throw new Error("Job lease has expired.");
+    }
+    if (leaseOwner !== undefined && job.leaseOwner !== leaseOwner) {
+      throw new Error("Job lease belongs to another agent identity.");
+    }
+    return job;
+  }
+
   async waitForResult(job, { timeoutMs, signal = undefined } = {}) {
+    job.resultDeadlineAt = Math.min(job.resultDeadlineAt, this.now() + timeoutMs);
     return await new Promise((resolve, reject) => {
       const cleanup = () => {
         clearTimeout(timer);
@@ -187,7 +216,7 @@ export class RelayQueue {
   #notifyWaiter() {
     while (this.waiters.length > 0) {
       const waiter = this.waiters.shift();
-      const claimed = this.claim();
+      const claimed = this.claim({ leaseOwner: waiter.leaseOwner });
       if (claimed) {
         waiter.resolve(claimed);
         return;
