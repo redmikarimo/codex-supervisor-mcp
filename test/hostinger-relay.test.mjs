@@ -194,15 +194,20 @@ async function agentSignedPost(baseUrl, path, bodyObject, overrides = {}) {
 }
 
 test("relay listen path does not wait for initialization or OAuth discovery", async (t) => {
+  let releaseInitialization;
+  const blocker = new Promise((resolve) => {
+    releaseInitialization = resolve;
+  });
   const { server, baseUrl } = await withRawRelay(t, {
     env: validEnv(),
     logger: { write() {} },
-    initializeDelayMs: 100,
+    initializeBlocker: () => blocker,
   });
   const initializePromise = server.initialize();
   const response = await fetch(`${baseUrl}/readyz`);
   assert.equal(response.status, 503);
   assert.deepEqual(await response.json(), { status: "initializing" });
+  releaseInitialization();
   const readiness = await initializePromise;
   assert.equal(readiness.status, "ready");
 });

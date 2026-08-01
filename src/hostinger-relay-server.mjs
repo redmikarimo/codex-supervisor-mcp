@@ -229,6 +229,7 @@ export function createHostingerRelayServer({
   queue,
   autoInitialize = true,
   initializeDelayMs = 0,
+  initializeBlocker = undefined,
 } = {}) {
   const state = {
     status: "initializing",
@@ -386,6 +387,9 @@ export function createHostingerRelayServer({
     try {
       if (initializeDelayMs > 0) {
         await new Promise((resolve) => setTimeout(resolve, initializeDelayMs));
+      }
+      if (initializeBlocker) {
+        await initializeBlocker();
       }
       state.config = buildRuntimeConfig({
         env,
