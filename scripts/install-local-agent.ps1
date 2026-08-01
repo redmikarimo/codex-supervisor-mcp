@@ -43,8 +43,15 @@ if ($RegisterScheduledTask) {
   $command = "Set-Location -LiteralPath '$escapedProjectPath'; npm run start:local-agent"
   $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -Command `"$command`""
   $trigger = New-ScheduledTaskTrigger -AtLogOn
-  $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel LeastPrivilege
-  Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Description 'Outbound-only Biotele MCP relay local agent' -Force | Out-Null
+  $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
+  try {
+    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Description 'Outbound-only Biotele MCP relay local agent' -Force | Out-Null
+  } catch {
+    if ($_.Exception.Message -match 'Access is denied') {
+      throw 'Scheduled task registration was denied. Re-run this installer from an Administrator PowerShell; the task itself remains least-privilege.'
+    }
+    throw
+  }
   Write-Host "Registered scheduled task: $TaskName"
 }
 

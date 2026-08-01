@@ -144,7 +144,9 @@ npm install
 The installer prompts for the agent HMAC secret without echoing it, stores local
 agent settings in the current user's environment, and optionally registers a
 least-privilege logon scheduled task. It does not put the secret in the task
-command.
+command. If Windows denies scheduled-task registration, rerun the installer
+from an Administrator PowerShell. The registered task still uses the `Limited`
+run level.
 
 Manual start:
 
