@@ -4,6 +4,9 @@ const DEFAULT_MAX_SKEW_MS = 5 * 60_000;
 const DEFAULT_MAX_EXPIRY_MS = 10 * 60_000;
 const HEADER_PREFIX = "x-biotele-relay";
 const PLACEHOLDER_SECRET_PATTERN = /replace-with|placeholder|example/i;
+const QUOTE_PATTERN = /[\u2018\u2019\u201A\u201B\u2032]/g;
+const DOUBLE_QUOTE_PATTERN = /[\u201C\u201D\u201E\u201F\u2033]/g;
+const DASH_PATTERN = /[\u2010-\u2015\u2212]/g;
 
 function header(req, name) {
   return req.headers[`${HEADER_PREFIX}-${name}`] ?? "";
@@ -26,6 +29,17 @@ function timingSafeStringEqual(left, right) {
   return timingSafeEqual(leftBuffer, rightBuffer);
 }
 
+function normalizeEnvText(value) {
+  return String(value)
+    .trim()
+    .replace(DOUBLE_QUOTE_PATTERN, '"')
+    .replace(QUOTE_PATTERN, "'");
+}
+
+function stripCredentialWrapper(value) {
+  return normalizeEnvText(value).replace(/^[\s{["']+|[\s}["']+$/g, "");
+}
+
 export function parseCredentialMap(raw, envName) {
   if (!raw) {
     throw new Error(`${envName} is required.`);
@@ -33,7 +47,10 @@ export function parseCredentialMap(raw, envName) {
 
   let parsed;
   try {
-    parsed = JSON.parse(raw);
+    parsed = JSON.parse(normalizeEnvText(raw));
+    if (typeof parsed === "string") {
+      parsed = JSON.parse(normalizeEnvText(parsed));
+    }
   } catch {
     parsed = null;
   }
@@ -50,14 +67,17 @@ export function parseCredentialMap(raw, envName) {
             if (separator <= 0) {
               throw new Error(`${envName} entries must be keyId:secret pairs.`);
             }
-            return [entry.slice(0, separator), entry.slice(separator + 1)];
+            return [
+              stripCredentialWrapper(entry.slice(0, separator)),
+              stripCredentialWrapper(entry.slice(separator + 1)),
+            ];
           });
 
   const credentials = new Map();
   for (const [keyId, secret] of entries) {
     const normalizedKeyId =
-      typeof keyId === "string" ? keyId.trim().replace(/[\u2010-\u2015\u2212]/g, "-") : keyId;
-    const normalizedSecret = typeof secret === "string" ? secret.trim() : secret;
+      typeof keyId === "string" ? stripCredentialWrapper(keyId).replace(DASH_PATTERN, "-") : keyId;
+    const normalizedSecret = typeof secret === "string" ? stripCredentialWrapper(secret) : secret;
     if (typeof normalizedKeyId !== "string" || !/^[A-Za-z0-9_.-]{3,128}$/.test(normalizedKeyId)) {
       throw new Error(`${envName} contains an invalid key id.`);
     }

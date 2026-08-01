@@ -366,6 +366,21 @@ test("split Hostinger agent secret defaults to the Windows agent key id", async 
   assert.equal((await response.json()).status, "ok");
 });
 
+test("legacy Hostinger agent keys accept JSON-like smart quotes and dash characters", async (t) => {
+  const { server, baseUrl } = await withRawRelay(t, {
+    env: {
+      ...validEnv(),
+      BIOTELE_RELAY_AGENT_KEYS: `{\u201Cwindows\u2013agent\u20131\u201D:\u201C${AGENT_SECRET}\u201D}`,
+    },
+    logger: { write() {} },
+  });
+  const readiness = await server.initialize();
+  assert.equal(readiness.status, "ready");
+  const response = await agentSignedPost(baseUrl, "/agent/status", {});
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).status, "ok");
+});
+
 test("split agent credential environment variables must be paired", async (t) => {
   const { server } = await withRawRelay(t, {
     env: {
