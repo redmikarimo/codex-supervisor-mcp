@@ -8,6 +8,7 @@ import {
   requiredPort,
   startHostingerRelay,
 } from "../src/hostinger-relay-server.mjs";
+import { buildHostingerCredentialProbe } from "../src/hostinger-env-probe.mjs";
 import { OAuthResourceServer } from "../src/oauth-resource-server.mjs";
 import { signRequest } from "../src/relay-auth.mjs";
 import { RelayQueue } from "../src/relay-queue.mjs";
@@ -323,6 +324,46 @@ test("startup and initialization error logs do not include secret values", async
   const output = logs.join("");
   assert.match(output, /Hostinger relay initialization failed/);
   assert.doesNotMatch(output, new RegExp(secret));
+});
+
+test("Hostinger credential probe reports key shape without secret values", () => {
+  const secret = "probe-secret-must-not-appear-0123456789";
+  const report = buildHostingerCredentialProbe({
+    BIOTELE_RELAY_AGENT_KEYS: JSON.stringify({
+      [`windows-agent-\u200b1`]: secret,
+    }),
+  });
+  const output = JSON.stringify(report);
+
+  assert.equal(report.selectedSource, "legacy");
+  assert.equal(report.legacy.directJson.ok, true);
+  assert.equal(report.legacy.directJson.parsed.entries[0].keyId.hasInvisibleFormatCharacter, true);
+  assert.deepEqual(report.legacy.directJson.parsed.entries[0].keyId.invalidCodePoints, ["U+200B"]);
+  assert.equal(report.legacy.directJson.parsed.entries[0].secret.length, Buffer.byteLength(secret));
+  assert.doesNotMatch(output, new RegExp(secret));
+  assert.doesNotMatch(output, /windows-agent/);
+});
+
+test("credential initialization failure emits a safe Hostinger probe", async (t) => {
+  const logs = [];
+  const secret = "startup-probe-secret-must-not-appear-0123456789";
+  const { server } = await withRawRelay(t, {
+    env: {
+      ...validEnv(),
+      BIOTELE_RELAY_AGENT_KEYS: JSON.stringify({
+        [`windows-agent-\u200b1`]: secret,
+      }),
+    },
+    logger: { write: (line) => logs.push(line) },
+  });
+  const readiness = await server.initialize();
+  const output = logs.join("");
+
+  assert.equal(readiness.status, "failed");
+  assert.match(output, /Hostinger relay credential probe:/);
+  assert.match(output, /U\+200B/);
+  assert.doesNotMatch(output, new RegExp(secret));
+  assert.doesNotMatch(output, /windows-agent/);
 });
 
 test("relay accepts split Hostinger agent credential environment variables", async (t) => {
