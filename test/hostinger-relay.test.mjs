@@ -337,6 +337,35 @@ test("relay accepts split Hostinger agent credential environment variables", asy
   assert.equal((await response.json()).status, "ok");
 });
 
+test("split Hostinger agent secret takes precedence over stale legacy placeholder", async (t) => {
+  const { server, baseUrl } = await withRawRelay(t, {
+    env: {
+      ...splitAgentEnv(),
+      BIOTELE_RELAY_AGENT_KEYS: '{"windows-agent-1":"replace-with-32-plus-byte-agent-secret"}',
+    },
+    logger: { write() {} },
+  });
+  const readiness = await server.initialize();
+  assert.equal(readiness.status, "ready");
+  const response = await agentSignedPost(baseUrl, "/agent/status", {});
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).status, "ok");
+});
+
+test("split Hostinger agent secret defaults to the Windows agent key id", async (t) => {
+  const env = splitAgentEnv();
+  delete env.BIOTELE_RELAY_AGENT_KEY_ID;
+  const { server, baseUrl } = await withRawRelay(t, {
+    env,
+    logger: { write() {} },
+  });
+  const readiness = await server.initialize();
+  assert.equal(readiness.status, "ready");
+  const response = await agentSignedPost(baseUrl, "/agent/status", {});
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).status, "ok");
+});
+
 test("split agent credential environment variables must be paired", async (t) => {
   const { server } = await withRawRelay(t, {
     env: {
@@ -347,7 +376,7 @@ test("split agent credential environment variables must be paired", async (t) =>
   });
   const readiness = await server.initialize();
   assert.equal(readiness.status, "failed");
-  assert.match(readiness.error.message, /must be set together/);
+  assert.match(readiness.error.message, /BIOTELE_RELAY_AGENT_SECRET is required/);
 });
 
 test("relay rejects missing OAuth token and returns WWW-Authenticate metadata", async (t) => {

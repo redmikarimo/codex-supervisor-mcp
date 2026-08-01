@@ -3,6 +3,7 @@ import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypt
 const DEFAULT_MAX_SKEW_MS = 5 * 60_000;
 const DEFAULT_MAX_EXPIRY_MS = 10 * 60_000;
 const HEADER_PREFIX = "x-biotele-relay";
+const PLACEHOLDER_SECRET_PATTERN = /replace-with|placeholder|example/i;
 
 function header(req, name) {
   return req.headers[`${HEADER_PREFIX}-${name}`] ?? "";
@@ -54,13 +55,19 @@ export function parseCredentialMap(raw, envName) {
 
   const credentials = new Map();
   for (const [keyId, secret] of entries) {
-    if (typeof keyId !== "string" || !/^[A-Za-z0-9_.-]{3,128}$/.test(keyId)) {
+    const normalizedKeyId =
+      typeof keyId === "string" ? keyId.trim().replace(/[\u2010-\u2015\u2212]/g, "-") : keyId;
+    const normalizedSecret = typeof secret === "string" ? secret.trim() : secret;
+    if (typeof normalizedKeyId !== "string" || !/^[A-Za-z0-9_.-]{3,128}$/.test(normalizedKeyId)) {
       throw new Error(`${envName} contains an invalid key id.`);
     }
-    if (typeof secret !== "string" || Buffer.byteLength(secret, "utf8") < 32) {
-      throw new Error(`${envName} secret for ${keyId} must contain at least 32 bytes.`);
+    if (typeof normalizedSecret !== "string" || Buffer.byteLength(normalizedSecret, "utf8") < 32) {
+      throw new Error(`${envName} secret for ${normalizedKeyId} must contain at least 32 bytes.`);
     }
-    credentials.set(keyId, secret);
+    if (PLACEHOLDER_SECRET_PATTERN.test(normalizedSecret)) {
+      throw new Error(`${envName} secret for ${normalizedKeyId} is still a placeholder.`);
+    }
+    credentials.set(normalizedKeyId, normalizedSecret);
   }
 
   if (credentials.size === 0) {

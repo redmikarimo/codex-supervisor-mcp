@@ -15,6 +15,7 @@ const DEFAULT_PROTOCOL_VERSION = "2025-11-25";
 const DEFAULT_PUBLIC_URL = "https://mcp.biotele.mx";
 const DEFAULT_READ_SCOPE = "biotele.mcp.read";
 const DEFAULT_WRITE_SCOPE = "biotele.mcp.write";
+const DEFAULT_AGENT_KEY_ID = "windows-agent-1";
 
 const READ_TOOLS = new Set([
   "codex_status",
@@ -43,11 +44,12 @@ function positiveIntegerFromEnv(env, name, defaultValue) {
 function agentCredentialsFromEnv(env) {
   const keyId = env.BIOTELE_RELAY_AGENT_KEY_ID;
   const secret = env.BIOTELE_RELAY_AGENT_SECRET;
-  if (keyId !== undefined || secret !== undefined) {
-    if (!keyId || !secret) {
-      throw new Error("BIOTELE_RELAY_AGENT_KEY_ID and BIOTELE_RELAY_AGENT_SECRET must be set together.");
-    }
-    return parseCredentialMap(`${keyId}:${secret}`, "BIOTELE_RELAY_AGENT_KEY_ID");
+  if (secret !== undefined && String(secret).trim() !== "") {
+    const resolvedKeyId = keyId && String(keyId).trim() ? keyId : DEFAULT_AGENT_KEY_ID;
+    return parseCredentialMap(`${resolvedKeyId}:${secret}`, "BIOTELE_RELAY_AGENT_KEY_ID");
+  }
+  if (keyId !== undefined && String(keyId).trim() !== "") {
+    throw new Error("BIOTELE_RELAY_AGENT_SECRET is required when BIOTELE_RELAY_AGENT_KEY_ID is set.");
   }
   return parseCredentialMap(env.BIOTELE_RELAY_AGENT_KEYS, "BIOTELE_RELAY_AGENT_KEYS");
 }
