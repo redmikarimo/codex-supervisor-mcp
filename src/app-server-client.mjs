@@ -7,6 +7,31 @@ import { EventStore } from "./event-store.mjs";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const MAX_STDERR_LINES = 100;
+const UNSAFE_WINDOWS_SHIM_PATTERN = /\.(?:cmd|bat|ps1)$/i;
+
+export function assertSafeAppServerCommand(command) {
+  if (typeof command !== "string" || !command.trim()) {
+    throw new Error("CODEX_BIN must name a native executable.");
+  }
+  if (UNSAFE_WINDOWS_SHIM_PATTERN.test(command.trim())) {
+    throw new Error(
+      "CODEX_BIN must be a native executable, not a .cmd, .bat, or .ps1 shell shim.",
+    );
+  }
+  return command;
+}
+
+export function sanitizeAppServerEnvironment(environment) {
+  const sanitized = {};
+  for (const [name, value] of Object.entries(environment ?? {})) {
+    const upperName = name.toUpperCase();
+    if (upperName.startsWith("BIOTELE_") || upperName.startsWith("CODEX_REMOTE_")) {
+      continue;
+    }
+    sanitized[name] = value;
+  }
+  return sanitized;
+}
 
 function parseAppServerArgs() {
   const raw = process.env.CODEX_APP_SERVER_ARGS;
@@ -37,9 +62,8 @@ function parseAppServerArgs() {
   return parsed;
 }
 
-function processFailureMessage(command, args, stderrLines) {
-  const suffix = stderrLines.length > 0 ? `\nCodex stderr:\n${stderrLines.join("\n")}` : "";
-  return `Codex app-server exited while running: ${[command, ...args].join(" ")}${suffix}`;
+function processFailureMessage(code, signal) {
+  return `Codex app-server exited unexpectedly (code=${String(code)}, signal=${String(signal)}). Inspect the local agent logs for details.`;
 }
 
 export class AppServerClient {
@@ -50,9 +74,9 @@ export class AppServerClient {
     eventStore = new EventStore(),
     requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
   } = {}) {
-    this.command = command;
+    this.command = assertSafeAppServerCommand(command);
     this.args = args;
-    this.env = env;
+    this.env = sanitizeAppServerEnvironment(env);
     this.eventStore = eventStore;
     this.requestTimeoutMs = requestTimeoutMs;
 
@@ -105,7 +129,7 @@ export class AppServerClient {
 
       if (!wasStopping) {
         const error = new AppServerError(
-          `${processFailureMessage(this.command, this.args, this.stderrLines)}\nExit: code=${String(code)}, signal=${String(signal)}`,
+          processFailureMessage(code, signal),
         );
         this.#rejectAll(error);
       }
@@ -140,8 +164,8 @@ export class AppServerClient {
         cleanup();
         reject(
           new AppServerError(
-            `Unable to start Codex app-server with "${this.command}". Install and authenticate the Codex CLI, or set CODEX_BIN.`,
-            { data: { cause: error.message } },
+            "Unable to start the configured Codex app-server. Verify the native CODEX_BIN path and Codex authentication in the local agent environment.",
+            { data: { causeCode: error.code ?? null } },
           ),
         );
       };
@@ -242,10 +266,8 @@ export class AppServerClient {
     return {
       state: this.state,
       pid: this.child?.pid ?? null,
-      command: this.command,
-      args: [...this.args],
-      loadedThreadIds: [...this.loadedThreads],
-      stderrTail: this.stderrLines.slice(-20),
+      loadedThreadCount: this.loadedThreads.size,
+      stderrLineCount: this.stderrLines.length,
     };
   }
 

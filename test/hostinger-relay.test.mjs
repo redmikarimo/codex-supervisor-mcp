@@ -11,6 +11,10 @@ import {
 import { OAuthResourceServer } from "../src/oauth-resource-server.mjs";
 import { signRequest } from "../src/relay-auth.mjs";
 import { RelayQueue } from "../src/relay-queue.mjs";
+import {
+  RESULT_SUBMISSION_PROTOCOL,
+  encodeResultSubmission,
+} from "../src/relay-result-protocol.mjs";
 
 const AGENT_KEY_ID = "windows-agent-1";
 const AGENT_SECRET = "agent-secret-0123456789-0123456789";
@@ -112,8 +116,10 @@ async function withIdentityProvider(t, { keys, rotatingKid = null } = {}) {
 async function withRelay(t, {
   queue = new RelayQueue(),
   issuer,
+  env = process.env,
 } = {}) {
   const server = createHostingerRelayServer({
+    env,
     queue,
     agentCredentials: new Map([[AGENT_KEY_ID, AGENT_SECRET]]),
     publicUrl: "https://mcp.biotele.mx",
@@ -182,7 +188,13 @@ async function oauthPost(baseUrl, path, bodyObject, token) {
   });
 }
 
-async function agentSignedPost(baseUrl, path, bodyObject, overrides = {}) {
+async function agentSignedPost(
+  baseUrl,
+  path,
+  bodyObject,
+  overrides = {},
+  extraHeaders = {},
+) {
   const body = JSON.stringify(bodyObject);
   const signed = signRequest({
     method: "POST",
@@ -197,6 +209,7 @@ async function agentSignedPost(baseUrl, path, bodyObject, overrides = {}) {
     headers: {
       "content-type": "application/json",
       ...signed.headers,
+      ...extraHeaders,
     },
     body,
   });
@@ -458,6 +471,24 @@ test("valid PORT is honored and invalid PORT is rejected", () => {
   assert.throws(() => requiredPort({ PORT: "abc" }), /PORT must be an integer/);
   assert.throws(() => requiredPort({ PORT: "-1" }), /PORT must be an integer/);
   assert.throws(() => requiredPort({ PORT: "70000" }), /PORT must be an integer/);
+});
+
+test("relay enforces safe result and lease configuration bounds", async (t) => {
+  for (const override of [
+    { BIOTELE_RELAY_MAX_RESULT_BYTES: "1" },
+    {
+      BIOTELE_RELAY_MCP_WAIT_MS: "60000",
+      BIOTELE_RELAY_JOB_LEASE_MS: "55000",
+    },
+  ]) {
+    const { server } = await withRawRelay(t, {
+      env: { ...validEnv(), ...override },
+      logger: { write() {} },
+      errorLogger: { write() {} },
+    });
+    const readiness = await server.initialize();
+    assert.equal(readiness.status, "failed");
+  }
 });
 
 test("startHostingerRelay calls listen immediately with resolved port", async (t) => {
@@ -852,6 +883,79 @@ test("relay accepts agent HMAC credentials on agent status route", async (t) => 
   assert.equal(response.status, 200);
   const payload = await response.json();
   assert.equal(payload.status, "ok");
+  assert.equal(payload.version, "1.2.3");
+  assert.equal(payload.resultSubmission.preferredProtocol, RESULT_SUBMISSION_PROTOCOL);
+  assert.ok(payload.resultSubmission.maxResultBytes >= 262_144);
+  assert.ok(payload.resultSubmission.chunkBytes <= 32 * 1024);
+});
+
+test("chunk result traffic has a separate authenticated rate budget", async (t) => {
+  const { server, baseUrl } = await withRawRelay(t, {
+    env: validEnv(),
+    logger: { write() {} },
+  });
+  await server.initialize();
+  for (let index = 0; index < 130; index += 1) {
+    const response = await agentSignedPost(baseUrl, "/agent/jobs/result", {
+      jobId: `missing-job-${index}`,
+      leaseId: `missing-lease-${index}`,
+      result: { index },
+    });
+    assert.equal(response.status, 409);
+  }
+});
+
+test("unauthenticated result failures keep the conservative pre-auth budget", async (t) => {
+  const { server, baseUrl } = await withRawRelay(t, {
+    env: {
+      ...validEnv(),
+      BIOTELE_RELAY_RATE_LIMIT_PER_MINUTE: "2",
+      BIOTELE_RELAY_RESULT_RATE_LIMIT_PER_MINUTE: "200",
+    },
+    logger: { write() {} },
+  });
+  await server.initialize();
+  for (const expectedStatus of [401, 401, 429]) {
+    const response = await fetch(`${baseUrl}/agent/jobs/result`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jobId: "missing", leaseId: "missing", result: {} }),
+    });
+    assert.equal(response.status, expectedStatus);
+  }
+});
+
+test("trusted proxy client buckets cannot poison another forwarded agent address", async (t) => {
+  const { server, baseUrl } = await withRawRelay(t, {
+    env: {
+      ...validEnv(),
+      BIOTELE_RELAY_TRUST_PROXY: "true",
+      BIOTELE_RELAY_RATE_LIMIT_PER_MINUTE: "2",
+      BIOTELE_RELAY_RESULT_RATE_LIMIT_PER_MINUTE: "200",
+    },
+    logger: { write() {} },
+  });
+  await server.initialize();
+  for (const expectedStatus of [401, 401, 429]) {
+    const response = await fetch(`${baseUrl}/agent/jobs/result`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-forwarded-for": "203.0.113.20, 198.51.100.20",
+      },
+      body: JSON.stringify({ jobId: "missing", leaseId: "missing", result: {} }),
+    });
+    assert.equal(response.status, expectedStatus);
+  }
+
+  const validAgent = await agentSignedPost(
+    baseUrl,
+    "/agent/jobs/result",
+    { jobId: "missing", leaseId: "missing", result: {} },
+    {},
+    { "x-forwarded-for": "203.0.113.30, 198.51.100.30" },
+  );
+  assert.equal(validAgent.status, 409);
 });
 
 test("relay exposes OAuth protected-resource metadata", async (t) => {
@@ -900,6 +1004,56 @@ test("relay queue leases jobs, rejects stale duplicate submissions, and accepts 
 
   queue.complete({ jobId: job.id, leaseId: secondClaim.leaseId, result: { ok: true } });
   assert.equal(queue.size, 0);
+});
+
+test("relay rejects expired leases and leases owned by another agent identity", () => {
+  let now = 1_000;
+  const queue = new RelayQueue({ jobTtlMs: 10_000, leaseMs: 100, now: () => now });
+  const job = queue.enqueue({
+    toolName: "codex_status",
+    arguments: {},
+    resultTimeoutMs: 2_000,
+  });
+  const claim = queue.claim({ leaseOwner: "agent-a" });
+  assert.throws(
+    () => queue.assertCurrentLease({
+      jobId: job.id,
+      leaseId: claim.leaseId,
+      leaseOwner: "agent-b",
+    }),
+    /another agent identity/,
+  );
+  now += 101;
+  assert.throws(
+    () => queue.assertCurrentLease({
+      jobId: job.id,
+      leaseId: claim.leaseId,
+      leaseOwner: "agent-a",
+    }),
+    /lease has expired/,
+  );
+});
+
+test("relay records the MCP result deadline before a waiting claim resolves", async () => {
+  let now = 1_000;
+  const queue = new RelayQueue({ jobTtlMs: 10_000, leaseMs: 5_000, now: () => now });
+  const claimPromise = queue.waitForClaimable({ timeoutMs: 1_000, leaseOwner: "agent-a" });
+  const job = queue.enqueue({
+    toolName: "codex_status",
+    arguments: {},
+    resultTimeoutMs: 2_000,
+  });
+  const resultPromise = queue.waitForResult(job, { timeoutMs: 2_000 });
+  const claim = await claimPromise;
+  assert.equal(claim.resultDeadlineAt, 3_000);
+  assert.equal(claim.resultBudgetMs, 2_000);
+  queue.complete({
+    jobId: job.id,
+    leaseId: claim.leaseId,
+    leaseOwner: "agent-a",
+    result: { ok: true },
+  });
+  assert.deepEqual(await resultPromise, { result: { ok: true } });
 });
 
 test("relay queue returns timeout result for uncompleted jobs", async () => {
@@ -951,4 +1105,166 @@ test("relay result submission completes a pending MCP read tool call through a m
   assert.equal(mcpResponse.status, 200);
   const payload = await mcpResponse.json();
   assert.deepEqual(payload.result, toolResult);
+});
+
+test("legacy result submissions obey the configured result limit and payload shape", async (t) => {
+  const key = createRsaKey("kid-1");
+  const idp = await withIdentityProvider(t, { keys: [key] });
+  const baseUrl = await withRelay(t, {
+    issuer: idp.issuer,
+    env: {
+      ...process.env,
+      BIOTELE_RELAY_MAX_RESULT_BYTES: "4096",
+    },
+  });
+  const token = mintJwt({ issuer: idp.issuer, key, scope: READ_SCOPE });
+  const mcpCall = oauthPost(
+    baseUrl,
+    "/mcp",
+    {
+      jsonrpc: "2.0",
+      id: 12,
+      method: "tools/call",
+      params: { name: "codex_list_threads", arguments: {} },
+    },
+    token,
+  );
+  const claim = await (await agentSignedPost(
+    baseUrl,
+    "/agent/jobs/claim",
+    { maxWaitMs: 100 },
+  )).json();
+
+  let response = await agentSignedPost(baseUrl, "/agent/jobs/result", {
+    jobId: claim.job.id,
+    leaseId: claim.job.leaseId,
+    result: { text: "x".repeat(5_000) },
+  });
+  assert.equal(response.status, 409);
+  assert.match((await response.json()).message, /relay limit is 4096 bytes/);
+
+  response = await agentSignedPost(baseUrl, "/agent/jobs/result", {
+    jobId: claim.job.id,
+    leaseId: claim.job.leaseId,
+    result: { ok: true },
+    error: { bad: true },
+  });
+  assert.equal(response.status, 409);
+  assert.match((await response.json()).message, /exactly one/);
+
+  response = await agentSignedPost(baseUrl, "/agent/jobs/result", {
+    jobId: claim.job.id,
+    leaseId: claim.job.leaseId,
+    result: { ok: true },
+  });
+  assert.equal(response.status, 202);
+  assert.equal((await mcpCall).status, 200);
+});
+
+test("relay reconstructs a large opaque multi-chunk result without plaintext on the wire", async (t) => {
+  const key = createRsaKey("kid-1");
+  const idp = await withIdentityProvider(t, { keys: [key] });
+  const baseUrl = await withRelay(t, { issuer: idp.issuer });
+  const token = mintJwt({ issuer: idp.issuer, key, scope: READ_SCOPE });
+  const mcpCall = oauthPost(
+    baseUrl,
+    "/mcp",
+    {
+      jsonrpc: "2.0",
+      id: 11,
+      method: "tools/call",
+      params: {
+        name: "codex_status",
+        arguments: { threadId: "thread-1", maxEvents: 100 },
+      },
+    },
+    token,
+  );
+
+  const claimResponse = await agentSignedPost(baseUrl, "/agent/jobs/claim", { maxWaitMs: 100 });
+  assert.equal(claimResponse.status, 200);
+  const claim = await claimResponse.json();
+  assert.equal(claim.resultSubmission.preferredProtocol, RESULT_SUBMISSION_PROTOCOL);
+
+  const WAF_TEXT = "powershell.exe -ExecutionPolicy Bypass <script>blocked</script>";
+  const toolResult = {
+    content: [{ type: "text", text: "Structured result available." }],
+    structuredContent: {
+      events: Array.from({ length: 5_000 }, (_, index) => ({
+        sequence: index,
+        command: `${WAF_TEXT} ${index}`,
+      })),
+    },
+    isError: false,
+  };
+  const encoded = encodeResultSubmission(
+    { result: toolResult },
+    {
+      maxResultBytes: claim.resultSubmission.maxResultBytes,
+      chunkBytes: claim.resultSubmission.chunkBytes,
+      uploadId: "upload-hostinger-large-result",
+    },
+  );
+  assert.ok(encoded.totalBytes > 262_144);
+  assert.ok(encoded.submissions.length > 1);
+
+  for (const [index, submission] of encoded.submissions.entries()) {
+    const wire = JSON.stringify({
+      jobId: claim.job.id,
+      leaseId: claim.job.leaseId,
+      submission,
+    });
+    assert.equal(wire.includes(WAF_TEXT), false);
+    assert.ok(Buffer.byteLength(wire) < 64 * 1024);
+    const response = await agentSignedPost(baseUrl, "/agent/jobs/result", {
+      jobId: claim.job.id,
+      leaseId: claim.job.leaseId,
+      submission,
+    });
+    assert.equal(response.status, 202);
+    const accepted = await response.json();
+    assert.equal(accepted.complete, index === encoded.submissions.length - 1);
+  }
+
+  const mcpResponse = await mcpCall;
+  assert.equal(mcpResponse.status, 200);
+  const payload = await mcpResponse.json();
+  assert.deepEqual(payload.result, toolResult);
+});
+
+test("relay rejects chunk uploads for a stale lease before buffering", async (t) => {
+  let now = 1_000;
+  const queue = new RelayQueue({
+    jobTtlMs: 10_000,
+    leaseMs: 100,
+    now: () => now,
+  });
+  const { server, baseUrl } = await withRawRelay(t, {
+    env: validEnv(),
+    queue,
+    logger: { write() {} },
+  });
+  const readiness = await server.initialize();
+  assert.equal(readiness.status, "ready");
+  const queued = queue.enqueue({
+    toolName: "codex_status",
+    arguments: { threadId: "thread-1" },
+  });
+  const first = queue.claim();
+  now += 101;
+  const second = queue.claim();
+  assert.equal(first.id, queued.id);
+  assert.notEqual(first.leaseId, second.leaseId);
+
+  const encoded = encodeResultSubmission(
+    { result: { ok: true } },
+    { uploadId: "upload-stale-lease-1234" },
+  );
+  const response = await agentSignedPost(baseUrl, "/agent/jobs/result", {
+    jobId: first.id,
+    leaseId: first.leaseId,
+    submission: encoded.submissions[0],
+  });
+  assert.equal(response.status, 409);
+  assert.match((await response.json()).message, /lease is not current/);
 });

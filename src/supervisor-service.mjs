@@ -354,7 +354,7 @@ export class CodexSupervisorService {
     };
   }
 
-  async readThread({ threadId, includeTurns = true }) {
+  async readThread({ threadId, includeTurns = false }) {
     const result = await this.appServerClient.request("thread/read", {
       threadId,
       includeTurns,

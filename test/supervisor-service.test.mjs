@@ -44,6 +44,16 @@ class RecordingClient {
       return { turn };
     }
 
+    if (method === "thread/read") {
+      return {
+        thread: {
+          id: params.threadId,
+          cwd: this.threadCwd,
+          status: { type: "idle" },
+        },
+      };
+    }
+
     throw new Error(`Unexpected method: ${method}`);
   }
 
@@ -75,6 +85,7 @@ test("CodexSupervisorService emits current app-server sandbox policies", async (
     prompt: "change a file",
     sandboxMode: "workspaceWrite",
   });
+  client.threadCwd = canonicalRepository;
   assert.match(workspaceTask.threadId, /^thread-/);
   assert.equal(workspaceTask.safety.approvalPolicy, "on-request");
 
@@ -124,4 +135,15 @@ test("CodexSupervisorService emits current app-server sandbox policies", async (
       }),
     /Network access is disabled/,
   );
+
+  await service.readThread({ threadId: workspaceTask.threadId });
+  assert.deepEqual(client.calls.at(-1), {
+    method: "thread/read",
+    params: { threadId: workspaceTask.threadId, includeTurns: false },
+  });
+  await service.readThread({ threadId: workspaceTask.threadId, includeTurns: true });
+  assert.deepEqual(client.calls.at(-1), {
+    method: "thread/read",
+    params: { threadId: workspaceTask.threadId, includeTurns: true },
+  });
 });

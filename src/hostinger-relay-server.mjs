@@ -10,8 +10,15 @@ import {
 import { OAuthResourceServer, bearerChallenge } from "./oauth-resource-server.mjs";
 import { RelayQueue } from "./relay-queue.mjs";
 import { RelayMonitor, monitorConfigFromEnv } from "./relay-monitor.mjs";
+import {
+  DEFAULT_MAX_RESULT_BYTES,
+  DEFAULT_RESULT_CHUNK_BYTES,
+  MIN_RESULT_BYTES,
+  ResultSubmissionAssembler,
+  resultSubmissionCapabilities,
+} from "./relay-result-protocol.mjs";
 
-const VERSION = "1.2.2";
+const VERSION = "1.2.3";
 const DEFAULT_PROTOCOL_VERSION = "2025-11-25";
 const DEFAULT_PUBLIC_URL = "https://mcp.biotele.mx";
 const DEFAULT_READ_SCOPE = "biotele.mcp.read";
@@ -41,6 +48,20 @@ function positiveIntegerFromEnv(env, name, defaultValue) {
     throw new Error(`${name} must be a positive integer.`);
   }
   return value;
+}
+
+function booleanFromEnv(env, name, defaultValue = false) {
+  const raw = env[name];
+  if (raw === undefined || String(raw).trim() === "") {
+    return defaultValue;
+  }
+  if (/^(?:1|true)$/i.test(String(raw).trim())) {
+    return true;
+  }
+  if (/^(?:0|false)$/i.test(String(raw).trim())) {
+    return false;
+  }
+  throw new Error(`${name} must be true, false, 1, or 0.`);
 }
 
 function standaloneBase64Secret(value) {
@@ -93,13 +114,40 @@ function buildRuntimeConfig({
 } = {}) {
   const resolvedPublicUrl = (publicUrl ?? env.BIOTELE_RELAY_PUBLIC_URL ?? DEFAULT_PUBLIC_URL).replace(/\/+$/, "");
   const oauthRequired = (env.BIOTELE_RELAY_OAUTH_REQUIRED ?? "true").toLowerCase() !== "false";
+  const trustProxy = booleanFromEnv(env, "BIOTELE_RELAY_TRUST_PROXY", false);
   const maxBodyBytes = positiveIntegerFromEnv(env, "BIOTELE_RELAY_MAX_BODY_BYTES", 262_144);
   const rateLimitPerMinute = positiveIntegerFromEnv(env, "BIOTELE_RELAY_RATE_LIMIT_PER_MINUTE", 120);
+  const resultRateLimitPerMinute = positiveIntegerFromEnv(
+    env,
+    "BIOTELE_RELAY_RESULT_RATE_LIMIT_PER_MINUTE",
+    600,
+  );
   const mcpWaitMs = positiveIntegerFromEnv(env, "BIOTELE_RELAY_MCP_WAIT_MS", 55_000);
   const agentPollMs = positiveIntegerFromEnv(env, "BIOTELE_RELAY_AGENT_POLL_MS", 25_000);
   const jobTtlMs = positiveIntegerFromEnv(env, "BIOTELE_RELAY_JOB_TTL_MS", 120_000);
   const jobLeaseMs = positiveIntegerFromEnv(env, "BIOTELE_RELAY_JOB_LEASE_MS", 60_000);
   const maxQueuedJobs = positiveIntegerFromEnv(env, "BIOTELE_RELAY_MAX_QUEUED_JOBS", 200);
+  const maxResultBytes = positiveIntegerFromEnv(
+    env,
+    "BIOTELE_RELAY_MAX_RESULT_BYTES",
+    DEFAULT_MAX_RESULT_BYTES,
+  );
+  if (maxResultBytes > DEFAULT_MAX_RESULT_BYTES) {
+    throw new Error(
+      `BIOTELE_RELAY_MAX_RESULT_BYTES may not exceed ${DEFAULT_MAX_RESULT_BYTES}.`,
+    );
+  }
+  if (maxResultBytes < MIN_RESULT_BYTES) {
+    throw new Error(`BIOTELE_RELAY_MAX_RESULT_BYTES must be at least ${MIN_RESULT_BYTES}.`);
+  }
+  if (jobLeaseMs < mcpWaitMs) {
+    throw new Error("BIOTELE_RELAY_JOB_LEASE_MS must be at least BIOTELE_RELAY_MCP_WAIT_MS.");
+  }
+  const safeChunkBytes = Math.floor(Math.max(0, maxBodyBytes - 4_096) * 3 / 4);
+  const resultChunkBytes = Math.min(DEFAULT_RESULT_CHUNK_BYTES, safeChunkBytes);
+  if (resultChunkBytes < 1_024) {
+    throw new Error("BIOTELE_RELAY_MAX_BODY_BYTES is too small for bounded result submissions.");
+  }
   const oauthJwksCacheMs = positiveIntegerFromEnv(env, "BIOTELE_RELAY_OAUTH_JWKS_CACHE_MS", 600_000);
   const oauthClockSkewSeconds = positiveIntegerFromEnv(env, "BIOTELE_RELAY_OAUTH_CLOCK_SKEW_SECONDS", 60);
 
@@ -114,22 +162,36 @@ function buildRuntimeConfig({
           clockSkewSeconds: oauthClockSkewSeconds,
         })
       : null);
+  const resolvedQueue =
+    queue ??
+    new RelayQueue({
+      jobTtlMs,
+      leaseMs: jobLeaseMs,
+      maxQueuedJobs,
+    });
+  const resultSubmission = resultSubmissionCapabilities({
+    maxResultBytes,
+    chunkBytes: resultChunkBytes,
+  });
 
   return {
     publicUrl: resolvedPublicUrl,
+    trustProxy,
     maxBodyBytes,
     rateLimiter: new RateLimiter({ limit: rateLimitPerMinute }),
+    agentAuthFailureLimiter: new RateLimiter({ limit: rateLimitPerMinute }),
+    resultRateLimiter: new RateLimiter({ limit: resultRateLimitPerMinute }),
     mcpWaitMs,
     agentPollMs,
     readScope: env.BIOTELE_RELAY_OAUTH_READ_SCOPE ?? DEFAULT_READ_SCOPE,
     writeScope: env.BIOTELE_RELAY_OAUTH_WRITE_SCOPE ?? DEFAULT_WRITE_SCOPE,
-    queue:
-      queue ??
-      new RelayQueue({
-        jobTtlMs,
-        leaseMs: jobLeaseMs,
-        maxQueuedJobs,
-      }),
+    queue: resolvedQueue,
+    resultSubmission,
+    resultAssembler: new ResultSubmissionAssembler({
+      maxResultBytes,
+      chunkBytes: resultChunkBytes,
+      ttlMs: jobTtlMs,
+    }),
     agents,
     oauth,
   };
@@ -203,6 +265,15 @@ class RateLimiter {
   }
 
   accept(key) {
+    return this.record(key) <= this.limit;
+  }
+
+  isBlocked(key) {
+    const minute = Math.floor(Date.now() / 60_000);
+    return (this.buckets.get(`${key}:${minute}`) ?? 0) >= this.limit;
+  }
+
+  record(key) {
     const minute = Math.floor(Date.now() / 60_000);
     const bucketKey = `${key}:${minute}`;
     const count = (this.buckets.get(bucketKey) ?? 0) + 1;
@@ -214,14 +285,21 @@ class RateLimiter {
         }
       }
     }
-    return count <= this.limit;
+    return count;
   }
 }
 
-function remoteAddress(req) {
+function remoteAddress(req, trustProxy = false) {
   const forwarded = req.headers["x-forwarded-for"];
-  if (typeof forwarded === "string" && forwarded.trim()) {
-    return forwarded.split(",")[0].trim();
+  if (trustProxy && typeof forwarded === "string" && forwarded.trim()) {
+    const chain = forwarded
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+    const nearestForwardedAddress = chain.at(-1);
+    if (nearestForwardedAddress && nearestForwardedAddress.length <= 256) {
+      return nearestForwardedAddress;
+    }
   }
   return req.socket.remoteAddress ?? "unknown";
 }
@@ -345,7 +423,12 @@ export function createHostingerRelayServer({
         return;
       }
 
-      if (!config.rateLimiter.accept(remoteAddress(req))) {
+      const isAgentResult = url.pathname === "/agent/jobs/result";
+      const preAuthAddress = remoteAddress(req, config.trustProxy);
+      if (
+        (isAgentResult && config.agentAuthFailureLimiter.isBlocked(preAuthAddress)) ||
+        (!isAgentResult && !config.rateLimiter.accept(preAuthAddress))
+      ) {
         json(res, 429, { error: "rate_limit_exceeded" });
         return;
       }
@@ -387,7 +470,16 @@ export function createHostingerRelayServer({
         url.pathname === "/agent/status" ||
         url.pathname === "/agent/monitor/test-alert"
       ) {
-        const { raw, parsed } = await readBody(req, config.maxBodyBytes);
+        let raw;
+        let parsed;
+        try {
+          ({ raw, parsed } = await readBody(req, config.maxBodyBytes));
+        } catch (error) {
+          if (isAgentResult) {
+            config.agentAuthFailureLimiter.record(preAuthAddress);
+          }
+          throw error;
+        }
         let auth;
         try {
           auth = authorizeAgent({
@@ -398,15 +490,21 @@ export function createHostingerRelayServer({
             nonceStore: state.nonceStore,
           });
         } catch (error) {
+          if (isAgentResult) {
+            config.agentAuthFailureLimiter.record(preAuthAddress);
+          }
           json(res, 401, { error: "unauthorized", message: error.message });
           return;
         }
-        if (!config.rateLimiter.accept(`agent:${auth.keyId}`)) {
+        const agentRateLimiter = isAgentResult
+          ? config.resultRateLimiter
+          : config.rateLimiter;
+        if (!agentRateLimiter.accept(`agent:${auth.keyId}`)) {
           json(res, 429, { error: "rate_limit_exceeded" });
           return;
         }
         monitor.recordAgentSeen();
-        await handleAgent({ req, res, url, parsed, config, monitor });
+        await handleAgent({ req, res, url, parsed, config, monitor, auth });
         return;
       }
 
@@ -559,6 +657,7 @@ async function handleMcp({ req, res, parsed, config, auth }) {
           toolName: name,
           arguments: args,
           requestId: String(message.id),
+          resultTimeoutMs: Math.min(config.mcpWaitMs, config.queue.jobTtlMs),
         });
         const outcome = await config.queue.waitForResult(job, {
           timeoutMs: Math.min(config.mcpWaitMs, config.queue.jobTtlMs),
@@ -583,7 +682,7 @@ async function handleMcp({ req, res, parsed, config, auth }) {
   });
 }
 
-async function handleAgent({ req, res, url, parsed, config, monitor }) {
+async function handleAgent({ req, res, url, parsed, config, monitor, auth }) {
   if (req.method !== "POST") {
     res.writeHead(405, { allow: "POST" });
     res.end();
@@ -594,6 +693,7 @@ async function handleAgent({ req, res, url, parsed, config, monitor }) {
     json(res, 200, {
       status: "ok",
       version: VERSION,
+      resultSubmission: config.resultSubmission,
       queue: {
         pending: config.queue.size,
       },
@@ -612,13 +712,16 @@ async function handleAgent({ req, res, url, parsed, config, monitor }) {
       0,
       Math.min(Number.parseInt(parsed?.maxWaitMs ?? String(config.agentPollMs), 10), config.agentPollMs),
     );
-    const job = await config.queue.waitForClaimable({ timeoutMs: waitMs });
+    const job = await config.queue.waitForClaimable({
+      timeoutMs: waitMs,
+      leaseOwner: auth.keyId,
+    });
     if (!job) {
       res.writeHead(204, { "cache-control": "no-store" });
       res.end();
       return;
     }
-    json(res, 200, { job });
+    json(res, 200, { job, resultSubmission: config.resultSubmission });
     return;
   }
 
@@ -629,11 +732,63 @@ async function handleAgent({ req, res, url, parsed, config, monitor }) {
     return;
   }
   try {
+    if (parsed?.submission !== undefined) {
+      const assembled = config.resultAssembler.accept({
+        jobId,
+        leaseId,
+        submission: parsed.submission,
+        assertLease: () => config.queue.assertCurrentLease({
+          jobId,
+          leaseId,
+          leaseOwner: auth.keyId,
+        }),
+      });
+      if (assembled.complete && !assembled.committed) {
+        config.queue.complete({
+          jobId,
+          leaseId,
+          leaseOwner: auth.keyId,
+          result: assembled.payload.result,
+          error: assembled.payload.error,
+        });
+        config.resultAssembler.commit({
+          jobId,
+          leaseId,
+          uploadId: parsed.submission.uploadId,
+        });
+      }
+      json(res, 202, {
+        accepted: true,
+        complete: assembled.complete,
+        duplicate: assembled.duplicate,
+        committed: assembled.committed || assembled.complete,
+      });
+      return;
+    }
+    const legacyPayload = {};
+    if (Object.prototype.hasOwnProperty.call(parsed, "result")) {
+      legacyPayload.result = parsed.result;
+    }
+    if (Object.prototype.hasOwnProperty.call(parsed, "error")) {
+      legacyPayload.error = parsed.error;
+    }
+    const hasResult = Object.prototype.hasOwnProperty.call(legacyPayload, "result");
+    const hasError = Object.prototype.hasOwnProperty.call(legacyPayload, "error");
+    if (hasResult === hasError) {
+      throw new Error("Legacy result submission must contain exactly one of result or error.");
+    }
+    const legacyBytes = Buffer.byteLength(JSON.stringify(legacyPayload), "utf8");
+    if (legacyBytes > config.resultSubmission.maxResultBytes) {
+      throw new Error(
+        `Legacy result submission is ${legacyBytes} bytes; the relay limit is ${config.resultSubmission.maxResultBytes} bytes.`,
+      );
+    }
     config.queue.complete({
       jobId,
       leaseId,
-      result: parsed.result,
-      error: parsed.error,
+      leaseOwner: auth.keyId,
+      result: legacyPayload.result,
+      error: legacyPayload.error,
     });
   } catch (error) {
     json(res, 409, { error: "result_rejected", message: error.message });

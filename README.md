@@ -133,7 +133,7 @@ are accepted by the bridge and normalized before the app-server request.
 | Variable | Default | Meaning |
 |---|---|---|
 | `CODEX_ALLOWED_ROOTS` | Required | Repository roots separated by the platform path-list delimiter. |
-| `CODEX_BIN` | `codex` | Codex executable path. |
+| `CODEX_BIN` | `codex` | Native Codex executable path. Windows `.cmd`, `.bat`, and `.ps1` shims are rejected. |
 | `CODEX_SUPERVISOR_MCP_NAME` | `codex-supervisor` | MCP config id disabled in the nested app-server to prevent recursion. |
 | `CODEX_ALLOW_NETWORK` | `0` | Set to `1` to allow callers to request network access. |
 | `CODEX_EVENT_LIMIT` | `1000` | In-memory event count, clamped to 100–10,000. |
@@ -163,10 +163,18 @@ equivalent disable override yourself.
 - Command and file-change approvals must be resolved explicitly.
 - Threads outside allowed roots are denied or filtered.
 - Event payloads are size-bounded before storage.
+- Relay and remote-server credentials (`BIOTELE_*` and `CODEX_REMOTE_*`) are
+  removed from the child Codex environment.
+- Remote result submissions are HMAC-authenticated, base64url encoded, split
+  into bounded chunks, and verified by length and SHA-256 before use. Encoding
+  protects the transport from content filters; it is not encryption.
 
-The child app-server still inherits the MCP server process environment and
-your broader Codex configuration. Audit environment secrets, apps, skills,
-hooks, and other configured MCP servers before using it with untrusted code.
+The child app-server still inherits non-relay process settings and your broader
+Codex configuration. Audit other environment secrets, apps, skills, hooks, and
+configured MCP servers before using it with untrusted code. Environment
+stripping is not an operating-system security boundary: a child running as the
+same Windows user can deliberately query user-scoped settings. Use a dedicated
+Windows account if that threat is in scope.
 
 ## Supported approval requests
 
@@ -223,7 +231,7 @@ repository and validates every task directory against `CODEX_ALLOWED_ROOTS`.
 
 ## Hostinger remote relay
 
-Version 1.2.0 adds a Hostinger-compatible relay for ChatGPT remote MCP access:
+Version 1.2.3 provides a Hostinger-compatible relay for ChatGPT remote MCP access:
 
 ```text
 ChatGPT -> OAuth bearer JWT -> Hostinger /mcp -> queued job -> outbound Windows local-agent -> Codex app-server
@@ -233,6 +241,10 @@ The public `/mcp` endpoint validates RS256 OAuth access tokens from an external
 identity provider. The Windows local-agent uses separate HMAC credentials only
 for outbound polling, status, lease acquisition, and result submission. The
 Hostinger relay never starts Codex and never reads local repositories.
+
+Deploy the updated relay before updating the Windows agent. The new relay still
+accepts legacy one-shot results, while the new agent uses the chunked format
+only after the relay advertises support.
 
 See [docs/REMOTE_DEPLOYMENT.md](docs/REMOTE_DEPLOYMENT.md) for Hostinger hPanel
 steps, DNS for `mcp.biotele.mx`, Auth0 setup, Microsoft Entra ID setup,
