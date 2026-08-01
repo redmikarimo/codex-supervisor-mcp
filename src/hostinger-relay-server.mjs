@@ -7,7 +7,6 @@ import {
   parseCredentialMap,
   verifySignedRequest,
 } from "./relay-auth.mjs";
-import { buildHostingerCredentialProbe } from "./hostinger-env-probe.mjs";
 import { OAuthResourceServer, bearerChallenge } from "./oauth-resource-server.mjs";
 import { RelayQueue } from "./relay-queue.mjs";
 
@@ -419,11 +418,6 @@ export function createHostingerRelayServer({
       state.status = "failed";
       state.error = sanitizedError(error);
       logger.write?.(`Hostinger relay initialization failed: ${state.error.type}: ${state.error.message}\n`);
-      if (/BIOTELE_RELAY_AGENT_(?:KEYS|KEY_ID|SECRET)/.test(state.error.message)) {
-        logger.write?.(
-          `Hostinger relay credential probe: ${JSON.stringify(buildHostingerCredentialProbe(env))}\n`,
-        );
-      }
     }
     return state;
   };
