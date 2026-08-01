@@ -177,7 +177,8 @@ agent settings in the current user's environment, and optionally registers a
 least-privilege logon scheduled task. It does not put the secret in the task
 command. If Windows denies scheduled-task registration, rerun the installer
 from an Administrator PowerShell. The registered task still uses the `Limited`
-run level.
+run level. It starts when available and restarts up to three times at one-minute
+intervals if the local-agent process exits.
 
 Manual start:
 
@@ -257,12 +258,21 @@ Only local-agent routes use HMAC:
 /agent/jobs/claim
 /agent/jobs/result
 /agent/status
+/agent/monitor/test-alert
 ```
 
 The signature covers method, path, timestamp, nonce, expiry, and SHA-256 body
 hash. Reused nonces are rejected until the replay window expires. Expired
 requests are rejected. OAuth bearer tokens are not accepted on agent routes,
 and agent HMAC credentials are not accepted on `/mcp`.
+
+`/agent/monitor/test-alert` sends one synthetic monitor alert through the
+configured webhook without changing relay readiness, queue state, Codex task
+state, or local-agent polling behavior. It requires the same agent HMAC
+signature as the polling routes and is intended for deployment verification
+after `BIOTELE_RELAY_MONITOR_WEBHOOK_URL` is configured. If no webhook URL is
+configured, the route returns an accepted response with `webhook_not_configured`
+and does not make an outbound request.
 
 ## MCP Transport
 
@@ -402,4 +412,5 @@ npm test
 Relay tests cover authentication, expiry, replay rejection, queue lifecycle,
 timeout, duplicate delivery lease rejection, OAuth token validation, scope
 authorization, protected-resource metadata, boundary rejection between OAuth and
-agent HMAC, result submission, and a mocked local-agent integration.
+agent HMAC, synthetic monitor test alerts, result submission, local-agent task
+restart settings, and a mocked local-agent integration.

@@ -1,6 +1,6 @@
 {
   "name": "codex-supervisor-mcp",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "Local and authenticated remote MCP bridge for supervising Codex app-server threads.",
   "type": "module",
   "private": true,

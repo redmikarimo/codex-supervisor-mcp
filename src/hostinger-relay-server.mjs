@@ -11,7 +11,7 @@ import { OAuthResourceServer, bearerChallenge } from "./oauth-resource-server.mj
 import { RelayQueue } from "./relay-queue.mjs";
 import { RelayMonitor, monitorConfigFromEnv } from "./relay-monitor.mjs";
 
-const VERSION = "1.2.1";
+const VERSION = "1.2.2";
 const DEFAULT_PROTOCOL_VERSION = "2025-11-25";
 const DEFAULT_PUBLIC_URL = "https://mcp.biotele.mx";
 const DEFAULT_READ_SCOPE = "biotele.mcp.read";
@@ -384,7 +384,8 @@ export function createHostingerRelayServer({
       if (
         url.pathname === "/agent/jobs/claim" ||
         url.pathname === "/agent/jobs/result" ||
-        url.pathname === "/agent/status"
+        url.pathname === "/agent/status" ||
+        url.pathname === "/agent/monitor/test-alert"
       ) {
         const { raw, parsed } = await readBody(req, config.maxBodyBytes);
         let auth;
@@ -405,7 +406,7 @@ export function createHostingerRelayServer({
           return;
         }
         monitor.recordAgentSeen();
-        await handleAgent({ req, res, url, parsed, config });
+        await handleAgent({ req, res, url, parsed, config, monitor });
         return;
       }
 
@@ -582,7 +583,7 @@ async function handleMcp({ req, res, parsed, config, auth }) {
   });
 }
 
-async function handleAgent({ req, res, url, parsed, config }) {
+async function handleAgent({ req, res, url, parsed, config, monitor }) {
   if (req.method !== "POST") {
     res.writeHead(405, { allow: "POST" });
     res.end();
@@ -597,6 +598,12 @@ async function handleAgent({ req, res, url, parsed, config }) {
         pending: config.queue.size,
       },
     });
+    return;
+  }
+
+  if (url.pathname === "/agent/monitor/test-alert") {
+    const delivery = await monitor.sendTestAlert();
+    json(res, 202, { accepted: true, delivery });
     return;
   }
 

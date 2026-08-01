@@ -330,6 +330,71 @@ test("relay health monitor tracks authenticated local-agent heartbeats", async (
   assert.equal((await response.json()).checks.agent.ok, false);
 });
 
+test("relay test alert route requires agent HMAC authentication", async (t) => {
+  const { server, baseUrl } = await withRawRelay(t, {
+    env: validEnv(),
+    logger: { write() {} },
+  });
+  await server.initialize();
+  const response = await fetch(`${baseUrl}/agent/monitor/test-alert`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{}",
+  });
+  assert.equal(response.status, 401);
+});
+
+test("relay test alert reports missing webhook without sending secrets", async (t) => {
+  const logs = [];
+  const { server, baseUrl } = await withRawRelay(t, {
+    env: validEnv(),
+    logger: { write() {} },
+    errorLogger: { write(message) { logs.push(message); } },
+  });
+  await server.initialize();
+  const response = await agentSignedPost(baseUrl, "/agent/monitor/test-alert", {});
+  assert.equal(response.status, 202);
+  const payload = await response.json();
+  assert.deepEqual(payload, {
+    accepted: true,
+    delivery: { delivered: false, reason: "webhook_not_configured" },
+  });
+  assert.match(logs.join(""), /Hostinger relay test alert requested/);
+  assert.doesNotMatch(logs.join(""), new RegExp(AGENT_SECRET));
+});
+
+test("relay test alert posts a synthetic webhook payload without real failure", async (t) => {
+  const logs = [];
+  let webhookRequest;
+  const { server, baseUrl } = await withRawRelay(t, {
+    env: {
+      ...validEnv(),
+      BIOTELE_RELAY_MONITOR_WEBHOOK_URL: "https://alerts.example.invalid/relay",
+    },
+    logger: { write() {} },
+    errorLogger: { write(message) { logs.push(message); } },
+    monitorFetch: async (url, options) => {
+      webhookRequest = { url, options };
+      return { ok: true, status: 202 };
+    },
+  });
+  await server.initialize();
+  const response = await agentSignedPost(baseUrl, "/agent/monitor/test-alert", {});
+  assert.equal(response.status, 202);
+  const payload = await response.json();
+  assert.deepEqual(payload.delivery, { delivered: true, statusCode: 202 });
+  assert.equal(webhookRequest.url, "https://alerts.example.invalid/relay");
+
+  const webhookBody = JSON.parse(webhookRequest.options.body);
+  assert.equal(webhookBody.type, "biotele.relay.test_alert");
+  assert.equal(webhookBody.status, "test");
+  assert.equal(webhookBody.relayStatus, "ok");
+  assert.equal(webhookBody.checks.readiness.ok, true);
+  assert.equal(webhookBody.checks.queue.pending, 0);
+  assert.doesNotMatch(webhookRequest.options.body, new RegExp(AGENT_SECRET));
+  assert.doesNotMatch(logs.join(""), /alerts\.example/);
+});
+
 test("/mcp fails closed while initializing", async (t) => {
   const { server, baseUrl } = await withRawRelay(t, {
     env: validEnv(),

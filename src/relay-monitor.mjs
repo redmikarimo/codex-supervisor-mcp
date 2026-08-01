@@ -189,24 +189,51 @@ export class RelayMonitor {
       return;
     }
 
+    await this.postWebhook({
+      type: "biotele.relay.health_alert",
+      status: snapshot.status,
+      checkedAt: snapshot.checkedAt,
+      consecutiveFailures: snapshot.consecutiveFailures,
+      failedChecks,
+      checks: snapshot.checks,
+    });
+  }
+
+  async sendTestAlert() {
+    const snapshot = this.snapshot();
+    this.errorLogger.write?.(`Hostinger relay test alert requested: status=${snapshot.status}\n`);
+
+    if (!this.config.webhookUrl || typeof this.fetchImpl !== "function") {
+      return { delivered: false, reason: "webhook_not_configured" };
+    }
+
+    return await this.postWebhook({
+      type: "biotele.relay.test_alert",
+      status: "test",
+      checkedAt: new Date(this.now()).toISOString(),
+      relayStatus: snapshot.status,
+      consecutiveFailures: this.consecutiveFailures,
+      checks: snapshot.checks,
+    });
+  }
+
+  async postWebhook(payload) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.config.webhookTimeoutMs);
     try {
-      await this.fetchImpl(this.config.webhookUrl, {
+      const response = await this.fetchImpl(this.config.webhookUrl, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          type: "biotele.relay.health_alert",
-          status: snapshot.status,
-          checkedAt: snapshot.checkedAt,
-          consecutiveFailures: snapshot.consecutiveFailures,
-          failedChecks,
-          checks: snapshot.checks,
-        }),
+        body: JSON.stringify(payload),
         signal: controller.signal,
       });
+      return {
+        delivered: response?.ok !== false,
+        statusCode: Number.isInteger(response?.status) ? response.status : null,
+      };
     } catch (error) {
-      this.errorLogger.write?.(`Hostinger relay health alert webhook failed: ${error.name}\n`);
+      this.errorLogger.write?.(`Hostinger relay alert webhook failed: ${error.name}\n`);
+      return { delivered: false, reason: error.name };
     } finally {
       clearTimeout(timeout);
     }

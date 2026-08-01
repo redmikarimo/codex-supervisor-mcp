@@ -12,5 +12,7 @@ test("local-agent installer registers a least-privilege Windows task", async () 
   assert.doesNotMatch(installer, /BIOTELE_RELAY_AGENT_SECRET[^\r\n]+New-ScheduledTaskAction/);
   assert.match(installer, /GetEnvironmentVariable\(`\$name, 'User'\)/);
   assert.match(installer, /-WindowStyle Hidden[^\r\n]+-EncodedCommand/);
+  assert.match(installer, /New-ScheduledTaskSettingsSet[^\r\n]+-RestartCount 3[^\r\n]+-RestartInterval/);
+  assert.match(installer, /Register-ScheduledTask[^\r\n]+-Settings \$settings/);
   assert.match(installer, /Scheduled task registration was denied/);
 });

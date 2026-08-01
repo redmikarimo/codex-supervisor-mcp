@@ -65,9 +65,10 @@ exit `$LASTEXITCODE
   $encodedStartup = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($startupScript))
   $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -EncodedCommand $encodedStartup" -WorkingDirectory $ProjectPath
   $trigger = New-ScheduledTaskTrigger -AtLogOn
+  $settings = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable
   $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
   try {
-    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Description 'Outbound-only Biotele MCP relay local agent' -Force | Out-Null
+    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description 'Outbound-only Biotele MCP relay local agent' -Force | Out-Null
   } catch {
     if ($_.Exception.Message -match 'Access is denied') {
       throw 'Scheduled task registration was denied. Re-run this installer from an Administrator PowerShell; the task itself remains least-privilege.'
