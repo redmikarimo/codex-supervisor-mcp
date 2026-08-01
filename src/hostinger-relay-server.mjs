@@ -17,6 +17,7 @@ const DEFAULT_PUBLIC_URL = "https://mcp.biotele.mx";
 const DEFAULT_READ_SCOPE = "biotele.mcp.read";
 const DEFAULT_WRITE_SCOPE = "biotele.mcp.write";
 const DEFAULT_AGENT_KEY_ID = "windows-agent-1";
+const BASE64_SECRET_PATTERN = /^[A-Za-z0-9+/]+={0,2}$/;
 
 const READ_TOOLS = new Set([
   "codex_status",
@@ -42,6 +43,18 @@ function positiveIntegerFromEnv(env, name, defaultValue) {
   return value;
 }
 
+function standaloneBase64Secret(value) {
+  const secret = String(value ?? "").trim();
+  if (!BASE64_SECRET_PATTERN.test(secret) || secret.length % 4 !== 0) {
+    return null;
+  }
+  const decoded = Buffer.from(secret, "base64");
+  if (decoded.length < 32 || decoded.toString("base64") !== secret) {
+    return null;
+  }
+  return secret;
+}
+
 function agentCredentialsFromEnv(env) {
   const keyId = env.BIOTELE_RELAY_AGENT_KEY_ID;
   const secret = env.BIOTELE_RELAY_AGENT_SECRET;
@@ -52,7 +65,12 @@ function agentCredentialsFromEnv(env) {
   if (keyId !== undefined && String(keyId).trim() !== "") {
     throw new Error("BIOTELE_RELAY_AGENT_SECRET is required when BIOTELE_RELAY_AGENT_KEY_ID is set.");
   }
-  return parseCredentialMap(env.BIOTELE_RELAY_AGENT_KEYS, "BIOTELE_RELAY_AGENT_KEYS");
+  const legacy = env.BIOTELE_RELAY_AGENT_KEYS;
+  const standaloneSecret = standaloneBase64Secret(legacy);
+  return parseCredentialMap(
+    standaloneSecret ? `${DEFAULT_AGENT_KEY_ID}:${standaloneSecret}` : legacy,
+    "BIOTELE_RELAY_AGENT_KEYS",
+  );
 }
 
 export function requiredPort(env = process.env) {

@@ -15,6 +15,7 @@ import { RelayQueue } from "../src/relay-queue.mjs";
 
 const AGENT_KEY_ID = "windows-agent-1";
 const AGENT_SECRET = "agent-secret-0123456789-0123456789";
+const BASE64_AGENT_SECRET = Buffer.alloc(48, 0x5a).toString("base64");
 const AUDIENCE = "https://mcp.biotele.mx/mcp";
 const READ_SCOPE = "biotele.mcp.read";
 const WRITE_SCOPE = "biotele.mcp.write";
@@ -405,6 +406,35 @@ test("split Hostinger agent secret defaults to the Windows agent key id", async 
   const response = await agentSignedPost(baseUrl, "/agent/status", {});
   assert.equal(response.status, 200);
   assert.equal((await response.json()).status, "ok");
+});
+
+test("Hostinger agent keys accept one canonical Base64 secret", async (t) => {
+  const { server, baseUrl } = await withRawRelay(t, {
+    env: {
+      ...validEnv(),
+      BIOTELE_RELAY_AGENT_KEYS: BASE64_AGENT_SECRET,
+    },
+    logger: { write() {} },
+  });
+  const readiness = await server.initialize();
+  assert.equal(readiness.status, "ready");
+  const response = await agentSignedPost(baseUrl, "/agent/status", {}, {
+    secret: BASE64_AGENT_SECRET,
+  });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).status, "ok");
+});
+
+test("standalone Hostinger agent secret must be canonical Base64", async (t) => {
+  const { server } = await withRawRelay(t, {
+    env: {
+      ...validEnv(),
+      BIOTELE_RELAY_AGENT_KEYS: `${BASE64_AGENT_SECRET.slice(0, -1)}!`,
+    },
+    logger: { write() {} },
+  });
+  const readiness = await server.initialize();
+  assert.equal(readiness.status, "failed");
 });
 
 test("legacy Hostinger agent keys accept JSON-like smart quotes and dash characters", async (t) => {

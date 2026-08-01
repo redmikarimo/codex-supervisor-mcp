@@ -122,6 +122,10 @@ uses OAuth bearer access tokens only. Agent HMAC credentials are separate and
 valid only on `/agent/jobs/claim`, `/agent/jobs/result`, and `/agent/status`.
 Prefer the split `BIOTELE_RELAY_AGENT_KEY_ID` and `BIOTELE_RELAY_AGENT_SECRET`
 variables on Hostinger because some hPanel fields normalize JSON-shaped values.
+If hPanel retains only `BIOTELE_RELAY_AGENT_KEYS`, set that variable to the raw
+canonical Base64 agent secret with no JSON, quotes, braces, or backslashes. The
+relay then uses `windows-agent-1` as the key ID. This single-secret format must
+decode to at least 32 bytes and is intended for one Hostinger-connected agent.
 
 ## Local Agent Installation
 
