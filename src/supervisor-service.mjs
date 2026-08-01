@@ -11,6 +11,11 @@ import {
   normalizeSandboxMode,
   toSandboxPolicyType,
 } from "./sandbox-mode.mjs";
+import {
+  containsCompletedAgentMessage,
+  isPersistedTurnCompleted,
+  PersistedThreadStatusCache,
+} from "./thread-transcript.mjs";
 
 const APPROVAL_METHODS = new Set([
   "item/commandExecution/requestApproval",
@@ -42,6 +47,26 @@ function extractThreadCwd(thread) {
   return thread?.cwd ?? thread?.workingDirectory ?? null;
 }
 
+function threadStatusType(thread) {
+  if (typeof thread?.status === "string") {
+    return thread.status;
+  }
+  return typeof thread?.status?.type === "string" ? thread.status.type : null;
+}
+
+function isPersistedThreadActive(thread) {
+  const status = threadStatusType(thread);
+  return status === "active" || status === "waitingOnApproval";
+}
+
+function projectThread(thread, includeTurns) {
+  if (includeTurns || !thread || typeof thread !== "object") {
+    return thread;
+  }
+  const { turns: _turns, ...compactThread } = thread;
+  return compactThread;
+}
+
 export class CodexSupervisorService {
   static async create({
     pathPolicy = undefined,
@@ -69,6 +94,7 @@ export class CodexSupervisorService {
     this.appServerClient = appServerClient;
     this.authorizedThreads = new Map();
     this.mutationLocks = new Map();
+    this.persistedThreadStatusCache = new PersistedThreadStatusCache();
   }
 
   async startTask({
@@ -277,12 +303,20 @@ export class CodexSupervisorService {
     maxEvents = 50,
     includeTurns = false,
   }) {
-    const authorization = await this.#ensureAuthorizedThread(threadId, { includeTurns });
-    return {
-      thread: authorization.thread,
-      ...this.eventStore.getSnapshot(threadId, { afterSequence, maxEvents }),
-      appServer: this.appServerClient.describe(),
-    };
+    return await this.#withMutationLock(`status:${threadId}`, async () => {
+      const authorization = await this.#ensureAuthorizedThread(threadId, {
+        includeTurns: true,
+      });
+      const snapshot = this.#reconcileStatusSnapshot(
+        authorization.thread,
+        this.eventStore.getSnapshot(threadId, { afterSequence, maxEvents }),
+      );
+      return {
+        thread: projectThread(authorization.thread, includeTurns),
+        ...snapshot,
+        appServer: this.appServerClient.describe(),
+      };
+    });
   }
 
   async wait({
@@ -466,7 +500,53 @@ export class CodexSupervisorService {
   }
 
   async close() {
+    this.persistedThreadStatusCache.clear();
     await this.appServerClient.stop();
+  }
+
+  #reconcileStatusSnapshot(thread, snapshot) {
+    const persisted = this.persistedThreadStatusCache.reconcile(thread);
+    const persistedMessage = persisted.latestAgentMessage;
+    const liveRecord = this.eventStore.getLatestAgentMessageRecord?.(thread?.id) ?? null;
+    let latestAgentMessage = persistedMessage?.text ?? "";
+
+    if (liveRecord?.text) {
+      if (liveRecord.complete) {
+        const represented = containsCompletedAgentMessage(thread, liveRecord);
+        latestAgentMessage = represented
+          ? (persistedMessage?.text ?? liveRecord.text)
+          : liveRecord.text;
+      } else {
+        const activeLiveMessage =
+          snapshot.activeTurnId !== null &&
+          liveRecord.turnId !== null &&
+          liveRecord.turnId === snapshot.activeTurnId;
+        latestAgentMessage = activeLiveMessage
+          ? liveRecord.text
+          : (persistedMessage?.text ?? "");
+      }
+    }
+
+    let activeTurnId = snapshot.activeTurnId;
+    if (
+      activeTurnId &&
+      isPersistedTurnCompleted(thread, activeTurnId) &&
+      !isPersistedThreadActive(thread)
+    ) {
+      activeTurnId = null;
+    }
+
+    const status =
+      activeTurnId === null && thread?.status !== undefined
+        ? thread.status
+        : snapshot.status;
+
+    return {
+      ...snapshot,
+      activeTurnId,
+      latestAgentMessage,
+      status,
+    };
   }
 
   async #ensureAuthorizedThread(

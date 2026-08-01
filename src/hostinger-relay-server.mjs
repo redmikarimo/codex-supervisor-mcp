@@ -19,7 +19,7 @@ import {
   resultSubmissionCapabilities,
 } from "./relay-result-protocol.mjs";
 
-const VERSION = "1.2.4";
+const VERSION = "1.2.5";
 const DEFAULT_PROTOCOL_VERSION = "2025-11-25";
 const SUPPORTED_PROTOCOL_VERSIONS = new Set([DEFAULT_PROTOCOL_VERSION]);
 const DEFAULT_PUBLIC_URL = "https://mcp.biotele.mx";

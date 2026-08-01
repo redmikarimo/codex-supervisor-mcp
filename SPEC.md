@@ -54,6 +54,12 @@ The current pain is uncertainty: a configured plugin may appear connected while 
 5. Invalid input, unknown task/session identifiers, timeout/empty-result behavior, and server restart/reconnection behavior are tested where supported.
 6. Bugs found are covered by regression tests and the relevant documentation/configuration is updated.
 7. Final reporting clearly separates automated/local validation from live browser validation.
+8. `codex_status.latestAgentMessage` reconciles live bridge state with the
+   authorized persisted transcript before responding. It includes completed
+   assistant messages from synthesized `rollout-*` turns, deterministically
+   selects the newest fully persisted response, refreshes after transcript
+   changes or terminal turns, and agrees with `codex_read_thread` without
+   exposing partial transcript writes.
 
 ## UX Flows
 
@@ -78,7 +84,11 @@ This is a tool-only conversational app; its outputs are compact structured data 
 - `codex_start`: start a thread and turn in an allowed repository.
 - `codex_send`: begin a follow-up turn only while the thread is idle.
 - `codex_steer`: append guidance to the active turn, optionally guarded by the expected turn ID.
-- `codex_status`: return thread state, current turn, recent events, latest message/diff/error, approvals, and event cursor.
+- `codex_status`: return thread state, current turn, recent events, latest
+  message/diff/error, approvals, and event cursor. Its latest assistant message
+  is reconciled with the persisted authorized thread on every status snapshot,
+  so externally completed and synthesized turns cannot leave a stale cached
+  bridge response behind.
 - `codex_wait`: long-poll from an event cursor until a terminal event, request, or bounded timeout.
 - `codex_interrupt`: cancel an active disposable turn.
 - `codex_list_threads` and `codex_read_thread`: list/read only threads whose current canonical paths remain authorized.

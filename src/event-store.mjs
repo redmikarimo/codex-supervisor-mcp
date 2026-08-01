@@ -1,6 +1,11 @@
+import {
+  MAX_RECONCILED_AGENT_TEXT,
+  normalizeAgentMessageText,
+} from "./thread-transcript.mjs";
+
 const DEFAULT_EVENT_LIMIT = 1_000;
 const MAX_STORED_VALUE_BYTES = 96 * 1024;
-const MAX_ACCUMULATED_TEXT = 200_000;
+const MAX_ACCUMULATED_TEXT = MAX_RECONCILED_AGENT_TEXT;
 
 export function rpcIdKey(id) {
   return `${typeof id}:${JSON.stringify(id)}`;
@@ -84,7 +89,7 @@ export class EventStore {
     this.turnThreads = new Map();
     this.threadStatuses = new Map();
     this.latestDiffs = new Map();
-    this.latestAgentMessages = new Map();
+    this.latestAgentMessageRecords = new Map();
     this.latestErrors = new Map();
     this.pendingRequests = new Map();
     this.waiters = new Set();
@@ -161,10 +166,22 @@ export class EventStore {
     }
 
     if (method === "item/agentMessage/delta" && threadId && typeof params?.delta === "string") {
-      this.latestAgentMessages.set(
-        threadId,
-        appendBounded(this.latestAgentMessages.get(threadId), params.delta),
-      );
+      const existing = this.latestAgentMessageRecords.get(threadId);
+      const itemId = params?.itemId ?? null;
+      const current =
+        existing?.turnId === turnId &&
+        existing?.itemId === itemId &&
+        existing.complete === false
+          ? existing.text
+          : "";
+      this.latestAgentMessageRecords.set(threadId, {
+        text: appendBounded(current, params.delta),
+        turnId,
+        itemId,
+        phase: params?.phase ?? null,
+        complete: false,
+        sequence: this.sequence + 1,
+      });
     }
 
     if (
@@ -173,7 +190,21 @@ export class EventStore {
       params?.item?.type === "agentMessage" &&
       typeof params.item.text === "string"
     ) {
-      this.latestAgentMessages.set(threadId, params.item.text.slice(-MAX_ACCUMULATED_TEXT));
+      const phase = params.item.phase ?? null;
+      const itemStatus =
+        typeof params.item.status === "string"
+          ? params.item.status
+          : params.item.status?.type ?? null;
+      this.latestAgentMessageRecords.set(threadId, {
+        text: normalizeAgentMessageText(params.item.text),
+        turnId,
+        itemId: params.item.id ?? null,
+        phase,
+        complete:
+          (phase === null || phase === "final_answer") &&
+          (itemStatus === null || itemStatus === "completed"),
+        sequence: this.sequence + 1,
+      });
     }
 
     if (method === "error" && threadId) {
@@ -262,6 +293,11 @@ export class EventStore {
     return this.activeTurns.get(threadId) ?? null;
   }
 
+  getLatestAgentMessageRecord(threadId) {
+    const record = this.latestAgentMessageRecords.get(threadId);
+    return record ? { ...record } : null;
+  }
+
   getSnapshot(threadId, { afterSequence = 0, maxEvents = 50 } = {}) {
     const events = this.getEvents(threadId, afterSequence, maxEvents);
     const eventCursor = events.length > 0 ? events.at(-1).sequence : Math.max(afterSequence, this.sequence);
@@ -269,7 +305,7 @@ export class EventStore {
       threadId,
       activeTurnId: this.getActiveTurnId(threadId),
       status: this.threadStatuses.get(threadId) ?? null,
-      latestAgentMessage: this.latestAgentMessages.get(threadId) ?? "",
+      latestAgentMessage: this.latestAgentMessageRecords.get(threadId)?.text ?? "",
       latestDiff: this.latestDiffs.get(threadId) ?? null,
       latestError: this.latestErrors.get(threadId) ?? null,
       pendingRequests: this.getPendingRequests(threadId),

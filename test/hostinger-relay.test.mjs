@@ -917,7 +917,7 @@ test("relay accepts agent HMAC credentials on agent status route", async (t) => 
   assert.equal(response.status, 200);
   const payload = await response.json();
   assert.equal(payload.status, "ok");
-  assert.equal(payload.version, "1.2.4");
+  assert.equal(payload.version, "1.2.5");
   assert.equal(payload.resultSubmission.preferredProtocol, RESULT_SUBMISSION_PROTOCOL);
   assert.ok(payload.resultSubmission.maxResultBytes >= 262_144);
   assert.ok(payload.resultSubmission.chunkBytes <= 32 * 1024);

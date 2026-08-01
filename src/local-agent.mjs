@@ -20,7 +20,7 @@ import {
   encodeResultSubmission,
 } from "./relay-result-protocol.mjs";
 
-const VERSION = "1.2.4";
+const VERSION = "1.2.5";
 const BASE_URL = (process.env.BIOTELE_RELAY_BASE_URL ?? "https://mcp.biotele.mx").replace(/\/+$/, "");
 const AGENT_KEY_ID = process.env.BIOTELE_RELAY_AGENT_KEY_ID ?? "";
 const AGENT_SECRET = process.env.BIOTELE_RELAY_AGENT_SECRET ?? "";
