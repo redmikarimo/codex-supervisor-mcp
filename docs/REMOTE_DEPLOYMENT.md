@@ -115,6 +115,14 @@ BIOTELE_RELAY_AGENT_POLL_MS=25000
 BIOTELE_RELAY_JOB_TTL_MS=120000
 BIOTELE_RELAY_JOB_LEASE_MS=60000
 BIOTELE_RELAY_MAX_QUEUED_JOBS=200
+BIOTELE_RELAY_MONITOR_ENABLED=true
+BIOTELE_RELAY_MONITOR_INTERVAL_MS=60000
+BIOTELE_RELAY_MONITOR_FAILURE_THRESHOLD=2
+BIOTELE_RELAY_MONITOR_ALERT_COOLDOWN_MS=300000
+BIOTELE_RELAY_MONITOR_QUEUE_WARNING_THRESHOLD=160
+BIOTELE_RELAY_MONITOR_AGENT_STALE_MS=120000
+BIOTELE_RELAY_MONITOR_WEBHOOK_URL=<optional HTTPS alert webhook URL>
+BIOTELE_RELAY_MONITOR_WEBHOOK_TIMEOUT_MS=10000
 ```
 
 Do not set `BIOTELE_RELAY_CLIENT_KEYS` for ChatGPT. The public MCP endpoint
@@ -126,6 +134,29 @@ If hPanel retains only `BIOTELE_RELAY_AGENT_KEYS`, set that variable to the raw
 canonical Base64 agent secret with no JSON, quotes, braces, or backslashes. The
 relay then uses `windows-agent-1` as the key ID. This single-secret format must
 decode to at least 32 bytes and is intended for one Hostinger-connected agent.
+
+## Relay Health Monitoring
+
+The relay exposes:
+
+- `/healthz`: lightweight process health.
+- `/readyz`: startup readiness.
+- `/monitorz`: non-secret monitor snapshot for readiness, queue pressure, and
+  local-agent heartbeat freshness.
+
+The in-process monitor is enabled by default. It checks the relay every
+`BIOTELE_RELAY_MONITOR_INTERVAL_MS`, writes failure alerts to stderr after
+`BIOTELE_RELAY_MONITOR_FAILURE_THRESHOLD` consecutive failures, and rate-limits
+repeat alerts with `BIOTELE_RELAY_MONITOR_ALERT_COOLDOWN_MS`. Set
+`BIOTELE_RELAY_MONITOR_WEBHOOK_URL` to send the same non-secret alert payload to
+an HTTPS alert receiver. Do not log or commit webhook URLs; store them only as
+Hostinger environment variables.
+
+Set `BIOTELE_RELAY_MONITOR_QUEUE_WARNING_THRESHOLD` below
+`BIOTELE_RELAY_MAX_QUEUED_JOBS` to alert before queue saturation. Set
+`BIOTELE_RELAY_MONITOR_AGENT_STALE_MS` to alert when no authenticated local-agent
+request has reached the relay recently. Leave either value unset to disable that
+specific check.
 
 ## Local Agent Installation
 
@@ -304,14 +335,35 @@ biotele.mcp.write
 4. Configure Authorization Code Flow with PKCE.
 5. Add the ChatGPT-provided callback URL to Allowed Callback URLs.
 6. Ensure access tokens for the API are RS256 JWTs.
-7. Set Hostinger:
+7. Authorize ChatGPT OAuth clients for the relay API's user-delegated
+   permissions. Auth0 can dynamically register ChatGPT clients successfully
+   while still rejecting authorization with this error if the API access grant
+   is missing:
+
+```text
+Client "<client_id>" is not authorized to access resource server "https://mcp.biotele.mx/mcp".
+```
+
+   For each registered ChatGPT application, open the application in Auth0,
+   choose API or Application Access for the relay API, and grant only:
+
+```text
+biotele.mcp.read
+biotele.mcp.write
+```
+
+   For future dynamically registered ChatGPT clients, configure the relay API's
+   default third-party application permissions to authorize user-delegated access
+   with the same two picked scopes. Keep client-credentials access unauthorized
+   unless a separate machine-to-machine client is intentionally introduced.
+8. Set Hostinger:
 
 ```text
 BIOTELE_RELAY_OAUTH_ISSUER=https://YOUR_TENANT.REGION.auth0.com/
 BIOTELE_RELAY_OAUTH_AUDIENCE=https://mcp.biotele.mx/mcp
 ```
 
-8. For single-user use, restrict the Auth0 application or API access to your
+9. For single-user use, restrict the Auth0 application or API access to your
    user/account and issue only the scopes you intend ChatGPT to use.
 
 ## Microsoft Entra ID Setup

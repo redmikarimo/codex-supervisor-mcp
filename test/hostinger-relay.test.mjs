@@ -232,6 +232,104 @@ test("/readyz returns 200 after initialization", async (t) => {
   assert.deepEqual(await response.json(), { status: "ready" });
 });
 
+test("/monitorz returns relay health without secrets after initialization", async (t) => {
+  const { server, baseUrl } = await withRawRelay(t, {
+    env: validEnv(),
+    logger: { write() {} },
+  });
+  await server.initialize();
+  const response = await fetch(`${baseUrl}/monitorz`);
+  assert.equal(response.status, 200);
+  const payload = await response.json();
+  assert.equal(payload.status, "ok");
+  assert.equal(payload.checks.readiness.ok, true);
+  assert.equal(payload.checks.queue.pending, 0);
+  assert.doesNotMatch(JSON.stringify(payload), new RegExp(AGENT_SECRET));
+});
+
+test("relay health monitor alerts on initialization failure without leaking secrets", async (t) => {
+  const logs = [];
+  let webhookRequest;
+  const { server } = await withRawRelay(t, {
+    env: {
+      ...validEnv(),
+      BIOTELE_RELAY_OAUTH_ISSUER: "",
+      BIOTELE_RELAY_MONITOR_FAILURE_THRESHOLD: "1",
+      BIOTELE_RELAY_MONITOR_WEBHOOK_URL: "https://alerts.example.invalid/relay",
+    },
+    logger: { write() {} },
+    errorLogger: { write(message) { logs.push(message); } },
+    monitorFetch: async (url, options) => {
+      webhookRequest = { url, options };
+      return { ok: true, status: 202 };
+    },
+  });
+  const readiness = await server.initialize();
+  assert.equal(readiness.status, "failed");
+  assert.match(logs.join(""), /Hostinger relay health alert/);
+  assert.equal(webhookRequest.url, "https://alerts.example.invalid/relay");
+  const webhookBody = JSON.parse(webhookRequest.options.body);
+  assert.equal(webhookBody.type, "biotele.relay.health_alert");
+  assert.equal(webhookBody.status, "degraded");
+  assert.match(webhookBody.failedChecks, /readiness/);
+  const emitted = `${logs.join("")}\n${webhookRequest.options.body}`;
+  assert.doesNotMatch(emitted, new RegExp(AGENT_SECRET));
+  assert.doesNotMatch(logs.join(""), /alerts\.example/);
+});
+
+test("relay health monitor alerts when queued jobs reach the warning threshold", async (t) => {
+  const queue = new RelayQueue();
+  let webhookBody;
+  const { server } = await withRawRelay(t, {
+    env: {
+      ...validEnv(),
+      BIOTELE_RELAY_MONITOR_QUEUE_WARNING_THRESHOLD: "1",
+      BIOTELE_RELAY_MONITOR_FAILURE_THRESHOLD: "1",
+      BIOTELE_RELAY_MONITOR_WEBHOOK_URL: "https://alerts.example.invalid/relay",
+    },
+    queue,
+    logger: { write() {} },
+    errorLogger: { write() {} },
+    monitorFetch: async (_url, options) => {
+      webhookBody = JSON.parse(options.body);
+      return { ok: true, status: 202 };
+    },
+  });
+  await server.initialize();
+  queue.enqueue({ toolName: "codex_status", arguments: { threadId: "thread-1" } });
+  const snapshot = await server.monitor.check();
+  assert.equal(snapshot.status, "degraded");
+  assert.equal(snapshot.checks.queue.ok, false);
+  assert.equal(webhookBody.checks.queue.pending, 1);
+});
+
+test("relay health monitor tracks authenticated local-agent heartbeats", async (t) => {
+  let now = 10_000;
+  const { server, baseUrl } = await withRawRelay(t, {
+    env: {
+      ...validEnv(),
+      BIOTELE_RELAY_MONITOR_AGENT_STALE_MS: "1000",
+    },
+    logger: { write() {} },
+    monitorNow: () => now,
+  });
+  await server.initialize();
+  let response = await fetch(`${baseUrl}/monitorz`);
+  assert.equal(response.status, 503);
+  assert.equal((await response.json()).checks.agent.ok, false);
+
+  response = await agentSignedPost(baseUrl, "/agent/status", {});
+  assert.equal(response.status, 200);
+  response = await fetch(`${baseUrl}/monitorz`);
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).checks.agent.ok, true);
+
+  now += 1_001;
+  response = await fetch(`${baseUrl}/monitorz`);
+  assert.equal(response.status, 503);
+  assert.equal((await response.json()).checks.agent.ok, false);
+});
+
 test("/mcp fails closed while initializing", async (t) => {
   const { server, baseUrl } = await withRawRelay(t, {
     env: validEnv(),

@@ -9,8 +9,9 @@ import {
 } from "./relay-auth.mjs";
 import { OAuthResourceServer, bearerChallenge } from "./oauth-resource-server.mjs";
 import { RelayQueue } from "./relay-queue.mjs";
+import { RelayMonitor, monitorConfigFromEnv } from "./relay-monitor.mjs";
 
-const VERSION = "1.2.0";
+const VERSION = "1.2.1";
 const DEFAULT_PROTOCOL_VERSION = "2025-11-25";
 const DEFAULT_PUBLIC_URL = "https://mcp.biotele.mx";
 const DEFAULT_READ_SCOPE = "biotele.mcp.read";
@@ -259,6 +260,8 @@ export function createHostingerRelayServer({
   oauthResourceServer,
   publicUrl,
   queue,
+  monitorFetch,
+  monitorNow,
   autoInitialize = true,
   initializeDelayMs = 0,
   initializeBlocker = undefined,
@@ -269,7 +272,16 @@ export function createHostingerRelayServer({
     config: null,
     nonceStore: new NonceStore(),
     initialized: false,
+    lastAgentSeenAt: null,
   };
+  const monitor = new RelayMonitor({
+    state,
+    config: monitorConfigFromEnv(env),
+    logger,
+    errorLogger,
+    fetchImpl: monitorFetch,
+    now: monitorNow,
+  });
 
   const server = http.createServer(async (req, res) => {
     const requestId = req.headers["x-request-id"] ?? randomUUID();
@@ -299,6 +311,12 @@ export function createHostingerRelayServer({
           return;
         }
         json(res, 200, { status: "ready" });
+        return;
+      }
+
+      if (url.pathname === "/monitorz") {
+        const snapshot = monitor.toJSON();
+        json(res, snapshot.status === "ok" ? 200 : 503, snapshot);
         return;
       }
 
@@ -386,6 +404,7 @@ export function createHostingerRelayServer({
           json(res, 429, { error: "rate_limit_exceeded" });
           return;
         }
+        monitor.recordAgentSeen();
         await handleAgent({ req, res, url, parsed, config });
         return;
       }
@@ -411,6 +430,7 @@ export function createHostingerRelayServer({
     },
   };
   server.readiness = state;
+  server.monitor = monitor;
   server.initialize = async () => {
     if (state.initialized) {
       return state;
@@ -440,14 +460,18 @@ export function createHostingerRelayServer({
         `Hostinger relay initialization failed: ${state.error.type}: ${state.error.message}\n`,
       );
     }
+    await monitor.check({ forceAlert: state.status !== "ready" });
     return state;
   };
 
   if (autoInitialize) {
     setImmediate(() => {
       void server.initialize();
+      monitor.start();
     });
   }
+
+  server.on("close", () => monitor.stop());
 
   return server;
 }
@@ -627,9 +651,11 @@ export function startHostingerRelay({
   server.listen(port, hostname, () => {
     logger.write?.(`Hostinger relay listening on port ${port}\n`);
     void server.initialize();
+    server.monitor?.start?.();
   });
 
   const shutdown = () => {
+    server.monitor?.stop?.();
     server.queue?.shutdown?.("Relay is shutting down.");
     server.closeIdleConnections?.();
     server.close(() => {
