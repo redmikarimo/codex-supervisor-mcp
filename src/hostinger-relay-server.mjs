@@ -7,7 +7,6 @@ import {
   parseCredentialMap,
   verifySignedRequest,
 } from "./relay-auth.mjs";
-import { buildHostingerCredentialProbe } from "./hostinger-env-probe.mjs";
 import { OAuthResourceServer, bearerChallenge } from "./oauth-resource-server.mjs";
 import { RelayQueue } from "./relay-queue.mjs";
 
@@ -254,7 +253,8 @@ function sanitizedError(error) {
 
 export function createHostingerRelayServer({
   env = process.env,
-  logger = process.stderr,
+  logger = process.stdout,
+  errorLogger = logger === process.stdout ? process.stderr : logger,
   agentCredentials,
   oauthResourceServer,
   publicUrl,
@@ -436,12 +436,9 @@ export function createHostingerRelayServer({
     } catch (error) {
       state.status = "failed";
       state.error = sanitizedError(error);
-      logger.write?.(`Hostinger relay initialization failed: ${state.error.type}: ${state.error.message}\n`);
-      if (/BIOTELE_RELAY_AGENT_(?:KEYS|KEY_ID|SECRET)/.test(state.error.message)) {
-        logger.write?.(
-          `Hostinger relay credential probe: ${JSON.stringify(buildHostingerCredentialProbe(env))}\n`,
-        );
-      }
+      errorLogger.write?.(
+        `Hostinger relay initialization failed: ${state.error.type}: ${state.error.message}\n`,
+      );
     }
     return state;
   };
@@ -616,11 +613,17 @@ async function handleAgent({ req, res, url, parsed, config }) {
 
 export function startHostingerRelay({
   env = process.env,
-  logger = process.stderr,
+  logger = process.stdout,
+  errorLogger = logger === process.stdout ? process.stderr : logger,
   hostname = "0.0.0.0",
 } = {}) {
   const port = requiredPort(env);
-  const server = createHostingerRelayServer({ env, logger, autoInitialize: false });
+  const server = createHostingerRelayServer({
+    env,
+    logger,
+    errorLogger,
+    autoInitialize: false,
+  });
   server.listen(port, hostname, () => {
     logger.write?.(`Hostinger relay listening on port ${port}\n`);
     void server.initialize();
