@@ -158,6 +158,8 @@ if (-not (Test-Path -LiteralPath $agentFile -PathType Leaf)) {
 $appServerArgs = ConvertTo-Json -Compress -InputObject @(
   '-c'
   'mcp_servers.codex-supervisor.enabled=false'
+  '-c'
+  'approvals_reviewer="user"'
   'app-server'
 )
 $configuration = [ordered]@{
