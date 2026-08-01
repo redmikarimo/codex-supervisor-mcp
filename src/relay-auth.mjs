@@ -7,6 +7,7 @@ const PLACEHOLDER_SECRET_PATTERN = /replace-with|placeholder|example/i;
 const QUOTE_PATTERN = /[\u2018\u2019\u201A\u201B\u2032]/g;
 const DOUBLE_QUOTE_PATTERN = /[\u201C\u201D\u201E\u201F\u2033]/g;
 const DASH_PATTERN = /[\u2010-\u2015\u2212]/g;
+const KEY_ID_WHITESPACE_PATTERN = /\s+/g;
 
 function header(req, name) {
   return req.headers[`${HEADER_PREFIX}-${name}`] ?? "";
@@ -76,7 +77,9 @@ export function parseCredentialMap(raw, envName) {
   const credentials = new Map();
   for (const [keyId, secret] of entries) {
     const normalizedKeyId =
-      typeof keyId === "string" ? stripCredentialWrapper(keyId).replace(DASH_PATTERN, "-") : keyId;
+      typeof keyId === "string"
+        ? stripCredentialWrapper(keyId).replace(DASH_PATTERN, "-").replace(KEY_ID_WHITESPACE_PATTERN, "")
+        : keyId;
     const normalizedSecret = typeof secret === "string" ? stripCredentialWrapper(secret) : secret;
     if (typeof normalizedKeyId !== "string" || !/^[A-Za-z0-9_.-]{3,128}$/.test(normalizedKeyId)) {
       throw new Error(`${envName} contains an invalid key id.`);

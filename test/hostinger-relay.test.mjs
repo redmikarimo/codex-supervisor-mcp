@@ -381,6 +381,21 @@ test("legacy Hostinger agent keys accept JSON-like smart quotes and dash charact
   assert.equal((await response.json()).status, "ok");
 });
 
+test("legacy Hostinger agent keys accept wrapped key ids", async (t) => {
+  const { server, baseUrl } = await withRawRelay(t, {
+    env: {
+      ...validEnv(),
+      BIOTELE_RELAY_AGENT_KEYS: `{"windows-agent-\n1":"${AGENT_SECRET}"}`,
+    },
+    logger: { write() {} },
+  });
+  const readiness = await server.initialize();
+  assert.equal(readiness.status, "ready");
+  const response = await agentSignedPost(baseUrl, "/agent/status", {});
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).status, "ok");
+});
+
 test("split agent credential environment variables must be paired", async (t) => {
   const { server } = await withRawRelay(t, {
     env: {
