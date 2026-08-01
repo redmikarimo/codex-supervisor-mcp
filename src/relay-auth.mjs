@@ -8,6 +8,8 @@ const QUOTE_PATTERN = /[\u2018\u2019\u201A\u201B\u2032]/g;
 const DOUBLE_QUOTE_PATTERN = /[\u201C\u201D\u201E\u201F\u2033]/g;
 const DASH_PATTERN = /[\u2010-\u2015\u2212]/g;
 const KEY_ID_WHITESPACE_PATTERN = /\s+/g;
+const HTML_QUOTE_PATTERN = /&(quot|#34|#x22);/gi;
+const HTML_APOSTROPHE_PATTERN = /&(apos|#39|#x27);/gi;
 
 function header(req, name) {
   return req.headers[`${HEADER_PREFIX}-${name}`] ?? "";
@@ -33,8 +35,12 @@ function timingSafeStringEqual(left, right) {
 function normalizeEnvText(value) {
   return String(value)
     .trim()
+    .replace(HTML_QUOTE_PATTERN, '"')
+    .replace(HTML_APOSTROPHE_PATTERN, "'")
     .replace(DOUBLE_QUOTE_PATTERN, '"')
-    .replace(QUOTE_PATTERN, "'");
+    .replace(QUOTE_PATTERN, "'")
+    .replace(/\\"/g, '"')
+    .replace(/\\'/g, "'");
 }
 
 function stripCredentialWrapper(value) {
