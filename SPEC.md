@@ -60,6 +60,27 @@ The current pain is uncertainty: a configured plugin may appear connected while 
    selects the newest fully persisted response, refreshes after transcript
    changes or terminal turns, and agrees with `codex_read_thread` without
    exposing partial transcript writes.
+9. Persisted transcripts larger than one MCP result are retrievable exactly in
+   chronological order through stable, bounded `codex_read_thread` pages. Each
+   page exposes `hasMore`, `nextCursor`, snapshot provenance, and ordered range
+   metadata; malformed, cross-thread, or stale cursors fail closed.
+10. Every paginated thread result is measured as the final modern complete MCP
+    result envelope (`responseByteBasis=modern-complete-mcp-envelope`) and is at
+    most 1,500,000 UTF-8 bytes; the legacy envelope is also required to fit.
+    This leaves at least 597,152 bytes of margin below the relay's fixed 2 MiB
+    result limit. Native full-turn requests start at no more than four turns and
+    halve adaptively. A single turn is the unavoidable app-server
+    materialization unit; if it cannot fit, it is returned as ordered base64url
+    chunks of its canonical UTF-8 JSON with byte offsets and SHA-256 integrity
+    metadata.
+11. Compact `codex_status` never requests the complete persisted history. It
+    walks at most the newest 16 turns through sequential one-turn metadata
+    pages, and hydrates only completed candidates through the exact native
+    backwards-cursor anchor. A final assistant item may occur anywhere in that
+    hydrated turn. Active/nonterminal prefixes are never fully hydrated; one
+    individual full turn remains the unavoidable native materialization unit.
+    Event trimming preserves the newest suffix and uses logarithmic envelope
+    measurements rather than repeatedly serializing after every removed event.
 
 ## UX Flows
 
@@ -86,12 +107,24 @@ This is a tool-only conversational app; its outputs are compact structured data 
 - `codex_steer`: append guidance to the active turn, optionally guarded by the expected turn ID.
 - `codex_status`: return thread state, current turn, recent events, latest
   message/diff/error, approvals, and event cursor. Its latest assistant message
-  is reconciled with the persisted authorized thread on every status snapshot,
-  so externally completed and synthesized turns cannot leave a stale cached
-  bridge response behind.
+  is reconciled from the newest bounded persisted turn pages on every
+  status snapshot, so externally completed and synthesized turns cannot leave
+  a stale cached bridge response behind. `includeTurns=true` returns the same
+  bounded first transcript page and pagination metadata as
+  `codex_read_thread`; it never restores the former unbounded read.
 - `codex_wait`: long-poll from an event cursor until a terminal event, request, or bounded timeout.
 - `codex_interrupt`: cancel an active disposable turn.
-- `codex_list_threads` and `codex_read_thread`: list/read only threads whose current canonical paths remain authorized.
+- `codex_list_threads` and `codex_read_thread`: list/read only threads whose
+  current canonical paths remain authorized. `codex_read_thread` without turns
+  preserves the compact response. With `includeTurns=true`, it accepts an
+  optional opaque `cursor` and `maxBytes` (16,384 through 1,500,000; default
+  1,500,000), uses the app-server's native chronological turn pagination, and
+  returns a source-compatible `thread.turns` array containing only whole turn
+  records that fit the page. Pagination metadata is additive. When one whole
+  turn is itself too large, `thread.turns` is empty and `turnFragment` carries
+  one ordered base64url segment of `JSON.stringify(turn)`; concatenating the
+  decoded segments and parsing the verified bytes reconstructs that turn
+  exactly at the reported transcript position.
 - `codex_list_approvals`: return inspectable pending command and file-change requests.
 - `codex_resolve_approval`: accept, accept for the session, decline, or cancel a supported inspected request.
 
@@ -100,3 +133,15 @@ The relay negotiates a supported protocol, requires the issued session on
 follow-up requests, and cancels or invalidates its work when the session is
 terminated. Same-thread mutations and approval responses are serialized. Public
 errors are redacted and bounded.
+
+Native app-server cursors remain internal. Public cursors are versioned and
+bind the thread id, chronological position, and durable head snapshot. If the
+append-only transcript changes before traversal completes, the next call
+returns a stale-cursor validation error instead of mixing snapshots. Replaying
+the same cursor against an unchanged snapshot returns the same page.
+The generated experimental app-server schema advertises `thread/items/list`,
+but the installed Codex runtime returns JSON-RPC `-32601` for that method. The
+bridge therefore depends only on supported `thread/turns/list`: snapshots hash
+one full head turn, and status hydration uses a metadata page's
+`backwardsCursor` with an opposite-direction one-turn full read whose turn id
+must match exactly.

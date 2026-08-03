@@ -54,6 +54,14 @@ class RecordingClient {
       };
     }
 
+    if (method === "thread/turns/list") {
+      return { data: [], nextCursor: null, backwardsCursor: null };
+    }
+
+    if (method === "thread/items/list") {
+      throw new Error("thread/items/list is not supported yet");
+    }
+
     throw new Error(`Unexpected method: ${method}`);
   }
 
@@ -110,6 +118,72 @@ class MutableThreadClient {
 
   async stop() {}
 }
+
+class RestartedSteerClient {
+  constructor(thread) {
+    this.thread = thread;
+    this.loadedThreads = new Set();
+    this.calls = [];
+  }
+
+  async request(method, params = {}) {
+    this.calls.push({ method, params });
+    if (method === "thread/read") {
+      return { thread: { ...this.thread, id: params.threadId } };
+    }
+    if (method === "thread/resume") {
+      this.loadedThreads.add(params.threadId);
+      return { thread: { ...this.thread, id: params.threadId } };
+    }
+    if (method === "turn/steer") {
+      if (!this.loadedThreads.has(params.threadId)) {
+        throw new Error("thread not found");
+      }
+      return { turnId: params.expectedTurnId };
+    }
+    throw new Error(`Unexpected method: ${method}`);
+  }
+
+  describe() {
+    return { state: "ready" };
+  }
+
+  async stop() {}
+}
+
+test("steer resumes a persisted thread after the app-server restarts", async (t) => {
+  const repository = await fs.mkdtemp(path.join(os.tmpdir(), "codex-supervisor-steer-"));
+  t.after(async () => {
+    await fs.rm(repository, { recursive: true, force: true });
+  });
+
+  const canonicalRepository = await fs.realpath(repository);
+  const pathPolicy = await PathPolicy.create({ allowedRoots: [repository] });
+  const client = new RestartedSteerClient({
+    id: "thread-persisted",
+    cwd: canonicalRepository,
+    status: { type: "active" },
+  });
+  const service = new CodexSupervisorService({
+    pathPolicy,
+    eventStore: new EventStore(),
+    appServerClient: client,
+  });
+
+  const result = await service.steer({
+    threadId: "thread-persisted",
+    expectedTurnId: "turn-active",
+    prompt: "continue",
+  });
+
+  assert.equal(result.turnId, "turn-active");
+  assert.deepEqual(client.calls.map((call) => call.method), [
+    "thread/read",
+    "thread/resume",
+    "turn/steer",
+  ]);
+  assert.equal(client.calls[1].params.cwd, canonicalRepository);
+});
 
 test("CodexSupervisorService emits current app-server sandbox policies", async (t) => {
   const repository = await fs.mkdtemp(path.join(os.tmpdir(), "codex-supervisor-service-"));
@@ -189,10 +263,21 @@ test("CodexSupervisorService emits current app-server sandbox policies", async (
     params: { threadId: workspaceTask.threadId, includeTurns: false },
   });
   await service.readThread({ threadId: workspaceTask.threadId, includeTurns: true });
-  assert.deepEqual(client.calls.at(-1), {
-    method: "thread/read",
-    params: { threadId: workspaceTask.threadId, includeTurns: true },
-  });
+  assert.equal(
+    client.calls.some(
+      (call) => call.method === "thread/read" && call.params.includeTurns === true,
+    ),
+    false,
+  );
+  assert.equal(
+    client.calls.some((call) => call.method === "thread/turns/list"),
+    true,
+  );
+  assert.equal(client.calls.at(-1).method, "thread/turns/list");
+  assert.equal(
+    client.calls.some((call) => call.method === "thread/items/list"),
+    false,
+  );
 });
 
 test("same-thread turns and approval resolutions are serialized", async (t) => {

@@ -9,6 +9,11 @@ import {
   normalizeSandboxMode,
 } from "./sandbox-mode.mjs";
 import {
+  DEFAULT_THREAD_PAGE_BYTES,
+  MAX_THREAD_PAGE_BYTES,
+  MIN_THREAD_PAGE_BYTES,
+} from "./thread-pagination.mjs";
+import {
   assertAllowedKeys,
   optionalBoolean,
   optionalEnum,
@@ -144,7 +149,7 @@ export const TOOL_DEFINITIONS = [
     name: "codex_status",
     title: "Read Codex status",
     description:
-      "Read a thread snapshot, current turn state, pending approvals, latest agent message, latest diff, and recent streamed events.",
+      "Read a bounded thread snapshot, current turn state, pending approvals, latest persisted agent message, latest diff, and recent streamed events. includeTurns returns the first bounded transcript page.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -165,7 +170,7 @@ export const TOOL_DEFINITIONS = [
         includeTurns: {
           type: "boolean",
           default: false,
-          description: "Include persisted turn history; this can produce a large response.",
+          description: "Include the first bounded persisted transcript page.",
         },
       },
       required: ["threadId"],
@@ -263,7 +268,7 @@ export const TOOL_DEFINITIONS = [
     name: "codex_read_thread",
     title: "Read Codex thread",
     description:
-      "Read a persisted authorized Codex thread. The bridge denies threads outside CODEX_ALLOWED_ROOTS.",
+      "Read a persisted authorized Codex thread. Large transcripts are returned in stable chronological pages below the relay result limit.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -272,7 +277,18 @@ export const TOOL_DEFINITIONS = [
         includeTurns: {
           type: "boolean",
           default: false,
-          description: "Include full persisted turns. Omit for the safer compact thread view.",
+          description: "Include a bounded chronological transcript page. Omit for the compact thread view.",
+        },
+        cursor: {
+          type: "string",
+          description: "Opaque nextCursor from the preceding page.",
+        },
+        maxBytes: {
+          type: "integer",
+          minimum: MIN_THREAD_PAGE_BYTES,
+          maximum: MAX_THREAD_PAGE_BYTES,
+          default: DEFAULT_THREAD_PAGE_BYTES,
+          description: "Maximum UTF-8 bytes for the final compact MCP result envelope.",
         },
       },
       required: ["threadId"],
@@ -473,10 +489,15 @@ export function createToolRegistry(service) {
 
     async codex_read_thread(rawArguments) {
       const input = requireObject(rawArguments ?? {}, "arguments");
-      assertAllowedKeys(input, ["threadId", "includeTurns"]);
+      assertAllowedKeys(input, ["threadId", "includeTurns", "cursor", "maxBytes"]);
       return await service.readThread({
         threadId: threadId(input.threadId),
         includeTurns: optionalBoolean(input.includeTurns, "includeTurns", false),
+        cursor: optionalString(input.cursor, "cursor", { maxLength: 16_384 }),
+        maxBytes: optionalInteger(input.maxBytes, "maxBytes", {
+          minimum: MIN_THREAD_PAGE_BYTES,
+          maximum: MAX_THREAD_PAGE_BYTES,
+        }),
       });
     },
 

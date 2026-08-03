@@ -41,6 +41,8 @@ results or errors.
 - `src/relay-auth.mjs`: agent-only HMAC signing, timestamp, nonce, and expiry checks.
 - `src/relay-queue.mjs`: short-lived in-memory queue with leases.
 - `scripts/install-local-agent.ps1`: Windows user-environment and scheduled-task helper.
+- `scripts/McpServerLauncher.cs`: hidden native `MCP Server.exe` task launcher.
+- `scripts/McpServerIcon.png.base64`: reproducible, hash-pinned launcher icon source.
 
 ## Hostinger hPanel Deployment
 
@@ -111,6 +113,7 @@ BIOTELE_RELAY_OAUTH_READ_SCOPE=biotele.mcp.read
 BIOTELE_RELAY_OAUTH_WRITE_SCOPE=biotele.mcp.write
 BIOTELE_RELAY_MAX_BODY_BYTES=262144
 BIOTELE_RELAY_MAX_RESULT_BYTES=2097152
+BIOTELE_RELAY_IDEMPOTENCY_MAX_BYTES=33554432
 BIOTELE_RELAY_RATE_LIMIT_PER_MINUTE=120
 BIOTELE_RELAY_RESULT_RATE_LIMIT_PER_MINUTE=600
 BIOTELE_RELAY_MCP_WAIT_MS=55000
@@ -127,6 +130,11 @@ BIOTELE_RELAY_MONITOR_AGENT_STALE_MS=120000
 BIOTELE_RELAY_MONITOR_WEBHOOK_URL=<optional HTTPS alert webhook URL>
 BIOTELE_RELAY_MONITOR_WEBHOOK_TIMEOUT_MS=10000
 ```
+
+`BIOTELE_RELAY_IDEMPOTENCY_MAX_BYTES` bounds retained settled tool outcomes. It
+must be at least `BIOTELE_RELAY_MAX_RESULT_BYTES` and must reserve 512 bytes for
+each `BIOTELE_RELAY_MAX_QUEUED_JOBS` entry so replay-sensitive tombstones remain
+fail-closed for the configured job TTL.
 
 Do not set `BIOTELE_RELAY_CLIENT_KEYS` for ChatGPT. The public MCP endpoint
 uses OAuth bearer access tokens only. Agent HMAC credentials are separate and
@@ -197,10 +205,24 @@ times at one-minute intervals if the local-agent process exits. Allowed roots
 must already exist; blank or non-filesystem roots are rejected before settings
 are written.
 
+The installer builds `%LOCALAPPDATA%\Biotele Codex MCP\MCP Server.exe` with the
+approved Biotele icon and registers that executable directly as the task action.
+There is no persistent PowerShell parent. The launcher reads only the required
+Biotele and Codex variable names from the current user's `HKCU\Environment`,
+copies their values into its own process without logging them, and starts the
+Node local-agent with no window. Node is assigned to a Windows job object with
+kill-on-close enabled, so stopping the scheduled task terminates the launcher
+and its Node child together. The launcher remains outbound-only and does not
+listen on a local port.
+
 Manual start:
 
 ```powershell
-node .\src\local-agent.mjs
+$launcher = Join-Path $env:LOCALAPPDATA 'Biotele Codex MCP\MCP Server.exe'
+& $launcher `
+  (Get-Command node.exe -CommandType Application).Source `
+  (Resolve-Path '.\src\local-agent.mjs').ProviderPath `
+  (Get-Location).ProviderPath
 ```
 
 Scheduled task operations:
@@ -377,6 +399,18 @@ relay memory and in the authenticated MCP response. Chunk traffic has its own
 authenticated rate budget so near-limit results do not consume the control-call
 budget. Failed authentication and malformed result requests remain subject to
 the smaller control-call budget before the larger authenticated budget applies.
+Tool results larger than 16 KiB keep their exact `structuredContent` but use a
+small descriptive text block, preventing the direct STDIO, loopback, and local
+agent transports from serializing the same large output twice.
+Paginated transcript and bounded status responses report
+`responseByteBasis=modern-complete-mcp-envelope`; `responseBytes` measures that
+complete transport envelope and may not exceed 1,500,000 bytes. The legacy
+envelope is smaller but is checked by the regression suite as well.
+The installed Codex app-server currently rejects the schema-advertised
+`thread/items/list` method with JSON-RPC `-32601`. Transcript snapshots and
+compact status therefore use only `thread/turns/list`: one full head turn for
+snapshot provenance, and sequential one-turn metadata pages with exact
+backwards-cursor hydration for completed status candidates.
 The relay sends a relative result budget with each claim; the agent anchors it
 to its own clock so ordinary Hostinger/Windows clock skew cannot invalidate a
 fresh lease.
@@ -411,6 +445,10 @@ Primary mitigations:
   remains to execute it and report the outcome safely.
 - Result uploads are opaque to intermediary content filters and bounded by
   per-result, per-chunk, aggregate-memory, and expiry limits.
+- Settled MCP outcomes use a separate byte-bounded idempotency cache. Large
+  read-only outcomes are evicted first; replay-sensitive mutation keys remain
+  fail-closed for their TTL even if byte pressure replaces the original outcome
+  with a compact tombstone.
 - The local-agent validates every requested `cwd` against `CODEX_ALLOWED_ROOTS`.
 - The spawned Codex process does not inherit `BIOTELE_*` or `CODEX_REMOTE_*`
   credentials.
@@ -509,6 +547,14 @@ BIOTELE_RELAY_OAUTH_AUDIENCE=https://mcp.biotele.mx/mcp
 8. Limit consent and app assignment to the intended user or tenant.
 
 ## Verification
+
+When validating a Windows local-agent restart, deploy the current relay build
+first. The relay removes an outstanding `/agent/jobs/claim` waiter when that
+agent connection disconnects; without that behavior, a job submitted
+immediately after restart can be leased to the dead long poll and wait for the
+full MCP timeout. After deployment, stop and restart the scheduled task, issue
+one immediate read-only status call, and then repeat warm-path samples. Do not
+close the cold-start gate based only on warm-path results.
 
 Run the full test suite before deployment:
 

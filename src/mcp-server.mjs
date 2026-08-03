@@ -2,6 +2,7 @@ import readline from "node:readline";
 
 import { sanitizeErrorData, sanitizeErrorText } from "./error-sanitization.mjs";
 import { AppServerError, SecurityError, ValidationError } from "./errors.mjs";
+import { completeToolResult } from "./tool-result.mjs";
 
 const SERVER_NAME = "codex-supervisor-mcp";
 const SERVER_TITLE = "Codex Supervisor MCP";
@@ -44,16 +45,6 @@ function jsonRpcError(id, code, message, data = undefined) {
   };
 }
 
-function completeToolResult(output, isModern, isError = false) {
-  const text = JSON.stringify(output, null, 2);
-  return {
-    ...(isModern ? { resultType: "complete" } : {}),
-    content: [{ type: "text", text }],
-    structuredContent: output,
-    isError,
-  };
-}
-
 function toolErrorResult(error, isModern) {
   const output = {
     error: {
@@ -68,7 +59,7 @@ function toolErrorResult(error, isModern) {
         : {}),
     },
   };
-  return completeToolResult(output, isModern, true);
+  return completeToolResult(output, { isModern, isError: true });
 }
 
 export class McpStdioServer {
@@ -313,7 +304,7 @@ export class McpStdioServer {
       await this.#send({
         jsonrpc: "2.0",
         id,
-        result: completeToolResult(output, isModern),
+        result: completeToolResult(output, { isModern }),
       });
     } catch (error) {
       if (error instanceof ValidationError) {

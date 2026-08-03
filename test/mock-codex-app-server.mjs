@@ -8,6 +8,7 @@ const pendingApprovals = new Map();
 let nextThread = 1;
 let nextTurn = 1;
 let nextApproval = 1;
+let initializeParams = null;
 
 const reader = readline.createInterface({
   input: process.stdin,
@@ -191,6 +192,7 @@ function handleRequest(message) {
   const { method, params = {} } = message;
 
   if (method === "initialize") {
+    initializeParams = structuredClone(params);
     send({
       id: message.id,
       result: {
@@ -199,6 +201,11 @@ function handleRequest(message) {
         platformOs: process.platform,
       },
     });
+    return;
+  }
+
+  if (method === "test/initializeParams") {
+    send({ id: message.id, result: initializeParams });
     return;
   }
 
@@ -266,6 +273,51 @@ function handleRequest(message) {
           ...(params.includeTurns ? { turns: thread.turns ?? [] } : { turns: undefined }),
         },
       },
+    });
+    return;
+  }
+
+  if (method === "thread/turns/list") {
+    const thread = threads.get(params.threadId);
+    if (!thread) {
+      send({
+        id: message.id,
+        error: { code: -32000, message: `Unknown thread: ${params.threadId}` },
+      });
+      return;
+    }
+    const source = structuredClone(thread.turns ?? []);
+    if (params.sortDirection === "desc") {
+      source.reverse();
+    }
+    const anchor = /^anchor:(\d+)$/.exec(params.cursor ?? "");
+    const offset = anchor
+      ? Number.parseInt(anchor[1], 10)
+      : Number.parseInt(params.cursor ?? "0", 10);
+    const limit = params.limit ?? source.length;
+    const data = source.slice(offset, offset + limit).map((turn) =>
+      params.itemsView === "notLoaded" ? { ...turn, items: [] } : turn,
+    );
+    const nextOffset = offset + data.length;
+    const originalIndex =
+      params.sortDirection === "desc"
+        ? source.length - 1 - offset
+        : offset;
+    send({
+      id: message.id,
+      result: {
+        data,
+        nextCursor: nextOffset < source.length ? String(nextOffset) : null,
+        backwardsCursor: data.length > 0 ? `anchor:${originalIndex}` : null,
+      },
+    });
+    return;
+  }
+
+  if (method === "thread/items/list") {
+    send({
+      id: message.id,
+      error: { code: -32601, message: "thread/items/list is not supported yet" },
     });
     return;
   }

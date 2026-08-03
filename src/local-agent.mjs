@@ -19,6 +19,10 @@ import {
   ResultTooLargeError,
   encodeResultSubmission,
 } from "./relay-result-protocol.mjs";
+import {
+  completeToolResult,
+  measureCompleteToolResultEnvelopeBytes,
+} from "./tool-result.mjs";
 
 const VERSION = "1.2.5";
 const BASE_URL = (process.env.BIOTELE_RELAY_BASE_URL ?? "https://mcp.biotele.mx").replace(/\/+$/, "");
@@ -33,7 +37,6 @@ const MAX_RESULT_BYTES = Number.parseInt(
   10,
 );
 const LEGACY_MAX_RESULT_BYTES = 128 * 1024;
-const MAX_INLINE_CONTENT_BYTES = 16 * 1024;
 const DEFAULT_COMPLETED_CACHE_ENTRIES = 100;
 const DEFAULT_COMPLETED_CACHE_BYTES = 8 * 1024 * 1024;
 const MIN_ADAPTIVE_CHUNK_BYTES = 512;
@@ -78,19 +81,6 @@ function redactError(error) {
   return sanitizeErrorText(error?.message ?? error);
 }
 
-function completeToolResult(output, isError = false) {
-  const serialized = JSON.stringify(output, null, 2);
-  const text =
-    Buffer.byteLength(serialized, "utf8") <= MAX_INLINE_CONTENT_BYTES
-      ? serialized
-      : `Structured result available (${Buffer.byteLength(serialized, "utf8")} bytes).`;
-  return {
-    content: [{ type: "text", text }],
-    structuredContent: output,
-    isError,
-  };
-}
-
 function errorToolResult(error) {
   return completeToolResult(
     {
@@ -112,7 +102,7 @@ function errorToolResult(error) {
           : {}),
       },
     },
-    true,
+    { isError: true },
   );
 }
 
@@ -322,7 +312,7 @@ export function negotiatedResultLimits(capability) {
 
 function boundToolResult(result, capability) {
   const { maxResultBytes } = negotiatedResultLimits(capability);
-  const actualBytes = Buffer.byteLength(JSON.stringify({ result }), "utf8");
+  const actualBytes = measureCompleteToolResultEnvelopeBytes(result);
   if (actualBytes <= maxResultBytes) {
     return result;
   }

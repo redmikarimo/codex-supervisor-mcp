@@ -58,3 +58,46 @@ test("process failure terminates only affected threads and clears invalid runtim
   assert.equal(unrelated.latestError, null);
   assert.deepEqual(unrelated.events, []);
 });
+
+test("live message records retain bounded turn-start ordering metadata", () => {
+  const store = new EventStore({ eventLimit: 100 });
+  for (let index = 0; index < 105; index += 1) {
+    store.recordTurnStart("thread-order", {
+      id: `turn-${index}`,
+      startedAt: 1_000 + index,
+    });
+  }
+  assert.equal(store.turnStartRecords.size, 100);
+  assert.equal(store.turnStartRecords.has("turn-0"), false);
+  assert.equal(store.turnStartRecords.get("turn-104").startedAt, 1_104);
+
+  store.record("item/agentMessage/delta", {
+    threadId: "thread-order",
+    turnId: "turn-104",
+    itemId: "item-104",
+    delta: "Working",
+  });
+  assert.equal(
+    store.getLatestAgentMessageRecord("thread-order").turnStartedAt,
+    1_104,
+  );
+
+  store.record("turn/started", {
+    threadId: "thread-order",
+    turn: { id: "turn-104", startedAt: 1_204 },
+  });
+  store.record("item/completed", {
+    threadId: "thread-order",
+    turnId: "turn-104",
+    item: {
+      type: "agentMessage",
+      id: "item-104",
+      text: "Bounded final",
+      phase: "final_answer",
+    },
+  });
+  assert.equal(
+    store.getLatestAgentMessageRecord("thread-order").turnStartedAt,
+    1_204,
+  );
+});

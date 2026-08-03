@@ -4,17 +4,21 @@ import http from "node:http";
 import test from "node:test";
 
 import {
+  DEFAULT_IDEMPOTENCY_MAX_BYTES,
+  ToolCallIdempotency,
   createHostingerRelayServer,
   requiredPort,
   startHostingerRelay,
 } from "../src/hostinger-relay-server.mjs";
 import { OAuthResourceServer } from "../src/oauth-resource-server.mjs";
+import { LocalRelayAgent, submitResult } from "../src/local-agent.mjs";
 import { signRequest } from "../src/relay-auth.mjs";
 import { RelayQueue } from "../src/relay-queue.mjs";
 import {
   RESULT_SUBMISSION_PROTOCOL,
   encodeResultSubmission,
 } from "../src/relay-result-protocol.mjs";
+import { measureToolResultEnvelopeBytes } from "../src/tool-result.mjs";
 
 const AGENT_KEY_ID = "windows-agent-1";
 const AGENT_SECRET = "agent-secret-0123456789-0123456789";
@@ -359,6 +363,60 @@ test("relay health monitor tracks authenticated local-agent heartbeats", async (
   assert.equal((await response.json()).checks.agent.ok, false);
 });
 
+test("disconnecting an agent long poll removes its waiter before a job can be leased", async (t) => {
+  const queue = new RelayQueue();
+  const { server, baseUrl } = await withRawRelay(t, {
+    env: validEnv(),
+    queue,
+    logger: { write() {} },
+  });
+  await server.initialize();
+
+  const body = JSON.stringify({ maxWaitMs: 25_000 });
+  const signed = signRequest({
+    method: "POST",
+    path: "/agent/jobs/claim",
+    body,
+    keyId: AGENT_KEY_ID,
+    secret: AGENT_SECRET,
+  });
+  const controller = new AbortController();
+  const abandoned = fetch(`${baseUrl}/agent/jobs/claim`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...signed.headers,
+    },
+    body,
+    signal: controller.signal,
+  });
+
+  for (let attempt = 0; attempt < 50 && queue.waiters.length === 0; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(queue.waiters.length, 1);
+  controller.abort();
+  await assert.rejects(abandoned, { name: "AbortError" });
+  for (let attempt = 0; attempt < 50 && queue.waiters.length !== 0; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(queue.waiters.length, 0);
+
+  const queued = queue.enqueue({
+    toolName: "codex_list_threads",
+    arguments: {},
+  });
+  const replacement = await agentSignedPost(
+    baseUrl,
+    "/agent/jobs/claim",
+    { maxWaitMs: 100 },
+  );
+  assert.equal(replacement.status, 200);
+  const payload = await replacement.json();
+  assert.equal(payload.job.id, queued.id);
+  assert.equal(payload.job.deliveryCount, 1);
+});
+
 test("relay test alert route requires agent HMAC authentication", async (t) => {
   const { server, baseUrl } = await withRawRelay(t, {
     env: validEnv(),
@@ -492,6 +550,7 @@ test("valid PORT is honored and invalid PORT is rejected", () => {
 test("relay enforces safe result and lease configuration bounds", async (t) => {
   for (const override of [
     { BIOTELE_RELAY_MAX_RESULT_BYTES: "1" },
+    { BIOTELE_RELAY_IDEMPOTENCY_MAX_BYTES: "4096" },
     {
       BIOTELE_RELAY_MCP_WAIT_MS: "60000",
       BIOTELE_RELAY_JOB_LEASE_MS: "55000",
@@ -505,6 +564,84 @@ test("relay enforces safe result and lease configuration bounds", async (t) => {
     const readiness = await server.initialize();
     assert.equal(readiness.status, "failed");
   }
+});
+
+test("relay defaults to a byte-bounded idempotency retention budget", () => {
+  assert.equal(DEFAULT_IDEMPOTENCY_MAX_BYTES, 32 * 1024 * 1024);
+});
+
+test("idempotency byte pressure evicts read outcomes before tombstoning mutations", async () => {
+  const idempotency = new ToolCallIdempotency({
+    ttlMs: 60_000,
+    maxEntries: 10,
+    maxBytes: 6_000,
+  });
+  const executions = new Map();
+  const execute = async (key, { replaySensitive, bytes }) =>
+    await idempotency.execute({
+      key,
+      hash: `hash-${key}`,
+      subject: "subject",
+      sessionId: "session",
+      replaySensitive,
+      start: async () => {
+        executions.set(key, (executions.get(key) ?? 0) + 1);
+        return { result: { text: key.repeat(bytes) } };
+      },
+    });
+
+  const firstWrite = await execute("write-a", { replaySensitive: true, bytes: 500 });
+  assert.equal(firstWrite.result.text.length, "write-a".length * 500);
+  await execute("read-a", { replaySensitive: false, bytes: 500 });
+  assert.equal(idempotency.entries.has("read-a"), false);
+  assert.equal(idempotency.entries.has("write-a"), true);
+
+  await execute("write-b", { replaySensitive: true, bytes: 500 });
+  assert.ok(idempotency.bytes <= idempotency.maxBytes);
+  assert.equal(idempotency.entries.get("write-a").tombstone, true);
+  const tombstone = await execute("write-a", { replaySensitive: true, bytes: 500 });
+  assert.deepEqual(
+    tombstone.error.type,
+    "IdempotencyOutcomeUnavailable",
+  );
+  assert.match(tombstone.error.message, /will not be executed again/);
+  assert.equal(executions.get("write-a"), 1);
+});
+
+test("entry pressure never evicts a replay-sensitive outcome and re-executes it", async () => {
+  const idempotency = new ToolCallIdempotency({
+    ttlMs: 60_000,
+    maxEntries: 1,
+    maxBytes: 1_000_000,
+  });
+  let writeExecutions = 0;
+  const write = () =>
+    idempotency.execute({
+      key: "write-only",
+      hash: "write-only-hash",
+      subject: "subject",
+      sessionId: "session",
+      replaySensitive: true,
+      start: async () => {
+        writeExecutions += 1;
+        return { result: { ok: true } };
+      },
+    });
+
+  assert.deepEqual(await write(), { result: { ok: true } });
+  await assert.rejects(
+    () => idempotency.execute({
+      key: "new-read",
+      hash: "new-read-hash",
+      subject: "subject",
+      sessionId: "session",
+      replaySensitive: false,
+      start: async () => ({ result: { ok: true } }),
+    }),
+    /registry is full/,
+  );
+  assert.deepEqual(await write(), { result: { ok: true } });
+  assert.equal(writeExecutions, 1);
 });
 
 test("startHostingerRelay calls listen immediately with resolved port", async (t) => {
@@ -1647,6 +1784,91 @@ test("relay reconstructs a large opaque multi-chunk result without plaintext on 
   assert.equal(mcpResponse.status, 200);
   const payload = await mcpResponse.json();
   assert.deepEqual(payload.result, toolResult);
+});
+
+test("local agent delivers a near-1.5 MB paginated result below the 2 MiB relay ceiling", async (t) => {
+  const key = createRsaKey("near-limit-page-kid");
+  const idp = await withIdentityProvider(t, { keys: [key] });
+  const baseUrl = await withRelay(t, { issuer: idp.issuer });
+  const token = mintJwt({ issuer: idp.issuer, key, scope: READ_SCOPE });
+  const sessionId = await initializeMcpSession(baseUrl, token);
+  const mcpCall = oauthPost(
+    baseUrl,
+    "/mcp",
+    {
+      jsonrpc: "2.0",
+      id: "near-limit-page",
+      method: "tools/call",
+      params: {
+        name: "codex_read_thread",
+        arguments: { threadId: "thread-near-limit", includeTurns: true },
+      },
+    },
+    token,
+    { "mcp-session-id": sessionId },
+  );
+  const claimResponse = await agentSignedPost(baseUrl, "/agent/jobs/claim", { maxWaitMs: 100 });
+  assert.equal(claimResponse.status, 200);
+  const claim = await claimResponse.json();
+  const output = {
+    thread: { id: "thread-near-limit", cwd: "C:\\allowed", status: { type: "idle" } },
+    pagination: {
+      mode: "base64url-json-utf8-v1",
+      hasMore: true,
+      nextCursor: "cursor-next-page",
+      offsetBytes: 0,
+    },
+    transcriptPage: {
+      data: "A".repeat(1_450_000),
+      lengthBytes: 1_087_500,
+    },
+  };
+  const envelopeBytes = measureToolResultEnvelopeBytes(output);
+  assert.ok(envelopeBytes > 1_400_000);
+  assert.ok(envelopeBytes <= 1_500_000);
+
+  let resultRequests = 0;
+  const request = async (path, body) => {
+    if (path === "/agent/jobs/result") {
+      resultRequests += 1;
+    }
+    const response = await agentSignedPost(baseUrl, path, body);
+    const payload = await response.json();
+    if (!response.ok) {
+      const error = new Error(payload.message ?? payload.error ?? `HTTP ${response.status}`);
+      error.statusCode = response.status;
+      error.transient = response.status >= 500;
+      throw error;
+    }
+    return payload;
+  };
+  const agent = new LocalRelayAgent({
+    service: { async close() {} },
+    tools: {
+      has(name) {
+        return name === "codex_read_thread";
+      },
+      async call() {
+        return output;
+      },
+    },
+    pathPolicy: { async resolveCwd() {} },
+    submit: (job, payload, capability) =>
+      submitResult(job, payload, capability, {
+        request,
+        sleepFn: async () => {},
+      }),
+  });
+  await agent.handleJob(claim.job, claim.resultSubmission);
+  assert.ok(resultRequests > 1);
+
+  const mcpResponse = await mcpCall;
+  assert.equal(mcpResponse.status, 200);
+  const responseText = await mcpResponse.text();
+  assert.ok(Buffer.byteLength(responseText, "utf8") < 2_000_000);
+  const payload = JSON.parse(responseText);
+  assert.equal(payload.result.structuredContent.transcriptPage.data.length, 1_450_000);
+  assert.equal(payload.result.isError, false);
 });
 
 test("relay rejects chunk uploads for a stale lease before buffering", async (t) => {

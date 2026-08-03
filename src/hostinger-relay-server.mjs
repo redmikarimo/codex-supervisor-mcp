@@ -27,6 +27,8 @@ const DEFAULT_READ_SCOPE = "biotele.mcp.read";
 const DEFAULT_WRITE_SCOPE = "biotele.mcp.write";
 const DEFAULT_AGENT_KEY_ID = "windows-agent-1";
 const DEFAULT_MCP_SESSION_TTL_MS = 24 * 60 * 60_000;
+export const DEFAULT_IDEMPOTENCY_MAX_BYTES = 32 * 1024 * 1024;
+export const IDEMPOTENCY_TOMBSTONE_MAX_BYTES = 512;
 const BASE64_SECRET_PATTERN = /^[A-Za-z0-9+/]+={0,2}$/;
 const MCP_SESSION_PATTERN = /^[\x21-\x7e]{1,128}$/;
 
@@ -144,6 +146,21 @@ function buildRuntimeConfig({
   if (maxResultBytes < MIN_RESULT_BYTES) {
     throw new Error(`BIOTELE_RELAY_MAX_RESULT_BYTES must be at least ${MIN_RESULT_BYTES}.`);
   }
+  const idempotencyMaxBytes = positiveIntegerFromEnv(
+    env,
+    "BIOTELE_RELAY_IDEMPOTENCY_MAX_BYTES",
+    DEFAULT_IDEMPOTENCY_MAX_BYTES,
+  );
+  if (idempotencyMaxBytes < maxResultBytes) {
+    throw new Error(
+      "BIOTELE_RELAY_IDEMPOTENCY_MAX_BYTES must be at least BIOTELE_RELAY_MAX_RESULT_BYTES.",
+    );
+  }
+  if (idempotencyMaxBytes < maxQueuedJobs * IDEMPOTENCY_TOMBSTONE_MAX_BYTES) {
+    throw new Error(
+      `BIOTELE_RELAY_IDEMPOTENCY_MAX_BYTES must allow ${IDEMPOTENCY_TOMBSTONE_MAX_BYTES} bytes per queued job.`,
+    );
+  }
   if (jobLeaseMs < mcpWaitMs) {
     throw new Error("BIOTELE_RELAY_JOB_LEASE_MS must be at least BIOTELE_RELAY_MCP_WAIT_MS.");
   }
@@ -180,6 +197,7 @@ function buildRuntimeConfig({
   const idempotency = new ToolCallIdempotency({
     ttlMs: jobTtlMs,
     maxEntries: maxQueuedJobs,
+    maxBytes: idempotencyMaxBytes,
   });
   const sessions = new McpSessionRegistry({
     ttlMs: DEFAULT_MCP_SESSION_TTL_MS,
@@ -460,15 +478,52 @@ function disconnectSignal(req, res) {
   };
 }
 
-class ToolCallIdempotency {
-  constructor({ ttlMs, maxEntries, now = () => Date.now() }) {
+function retainedOutcomeBytes(value, rejected) {
+  const measurable =
+    rejected && value instanceof Error
+      ? {
+          name: value.name,
+          message: value.message,
+          stack: value.stack,
+          data: value.data,
+        }
+      : value;
+  return Buffer.byteLength(JSON.stringify(measurable) ?? "null", "utf8");
+}
+
+export class ToolCallIdempotency {
+  constructor({ ttlMs, maxEntries, maxBytes, now = () => Date.now() }) {
+    for (const [value, name] of [
+      [ttlMs, "ttlMs"],
+      [maxEntries, "maxEntries"],
+      [maxBytes, "maxBytes"],
+    ]) {
+      if (!Number.isSafeInteger(value) || value <= 0) {
+        throw new Error(`${name} must be a positive integer.`);
+      }
+    }
+    if (maxBytes < maxEntries * IDEMPOTENCY_TOMBSTONE_MAX_BYTES) {
+      throw new Error(
+        `maxBytes must allow ${IDEMPOTENCY_TOMBSTONE_MAX_BYTES} bytes per entry.`,
+      );
+    }
     this.ttlMs = ttlMs;
     this.maxEntries = maxEntries;
+    this.maxBytes = maxBytes;
     this.now = now;
     this.entries = new Map();
+    this.bytes = 0;
   }
 
-  async execute({ key, hash, subject, sessionId, signal, start }) {
+  async execute({
+    key,
+    hash,
+    subject,
+    sessionId,
+    signal,
+    start,
+    replaySensitive = false,
+  }) {
     this.#reap();
     if (signal?.aborted) {
       throw signal.reason;
@@ -491,6 +546,8 @@ class ToolCallIdempotency {
         sessionId,
         controller,
         state: "pending",
+        replaySensitive,
+        tombstone: false,
         subscribers: 0,
         expiresAt: Number.POSITIVE_INFINITY,
         promise: null,
@@ -500,11 +557,11 @@ class ToolCallIdempotency {
         .then(() => start(controller.signal))
         .then(
           (value) => {
-            this.#settle(key, entry);
+            this.#settle(key, entry, value, false);
             return value;
           },
           (error) => {
-            this.#settle(key, entry);
+            this.#settle(key, entry, error, true);
             throw error;
           },
         );
@@ -522,7 +579,7 @@ class ToolCallIdempotency {
       if (entry.subject !== subject || entry.sessionId !== sessionId) {
         continue;
       }
-      this.entries.delete(key);
+      this.#delete(key);
       if (entry.state === "pending" && !entry.controller.signal.aborted) {
         entry.controller.abort(reason);
       }
@@ -537,6 +594,7 @@ class ToolCallIdempotency {
       }
     }
     this.entries.clear();
+    this.bytes = 0;
   }
 
   async #subscribe(entry, signal) {
@@ -588,29 +646,89 @@ class ToolCallIdempotency {
     });
   }
 
-  #settle(key, entry) {
+  #settle(key, entry, value, rejected) {
     if (this.entries.get(key) !== entry) {
       return;
     }
     entry.state = "settled";
     entry.expiresAt = this.now() + this.ttlMs;
+    try {
+      entry.bytes = retainedOutcomeBytes(value, rejected);
+    } catch {
+      entry.bytes = this.maxBytes + 1;
+    }
+    this.bytes += entry.bytes;
+    this.#enforceByteLimit();
   }
 
   #makeRoom() {
     while (this.entries.size >= this.maxEntries) {
-      const settled = [...this.entries].find(([, entry]) => entry.state === "settled");
+      const settled = [...this.entries].find(
+        ([, entry]) => entry.state === "settled" && !entry.replaySensitive,
+      );
       if (!settled) {
         throw new Error("Relay idempotency registry is full.");
       }
-      this.entries.delete(settled[0]);
+      this.#delete(settled[0]);
     }
+  }
+
+  #enforceByteLimit() {
+    while (this.bytes > this.maxBytes) {
+      const readOnly = [...this.entries].find(
+        ([, entry]) => entry.state === "settled" && !entry.replaySensitive,
+      );
+      if (readOnly) {
+        this.#delete(readOnly[0]);
+        continue;
+      }
+      const replaySensitive = [...this.entries].find(
+        ([, entry]) =>
+          entry.state === "settled" &&
+          entry.replaySensitive &&
+          !entry.tombstone,
+      );
+      if (!replaySensitive) {
+        return;
+      }
+      this.#compactReplaySensitive(replaySensitive[1]);
+    }
+  }
+
+  #compactReplaySensitive(entry) {
+    const outcome = {
+      error: {
+        type: "IdempotencyOutcomeUnavailable",
+        message:
+          "The retained outcome for this replay-sensitive operation exceeded the relay idempotency byte budget. The operation will not be executed again; inspect current Codex state before issuing a new request.",
+      },
+    };
+    const tombstoneBytes = retainedOutcomeBytes(outcome, false);
+    if (tombstoneBytes > IDEMPOTENCY_TOMBSTONE_MAX_BYTES) {
+      throw new Error("Relay idempotency tombstone exceeds its fixed byte budget.");
+    }
+    this.bytes -= entry.bytes ?? 0;
+    entry.tombstone = true;
+    entry.promise = Promise.resolve(outcome);
+    entry.bytes = tombstoneBytes;
+    this.bytes += entry.bytes;
+  }
+
+  #delete(key) {
+    const entry = this.entries.get(key);
+    if (!entry) {
+      return false;
+    }
+    this.entries.delete(key);
+    this.bytes -= entry.bytes ?? 0;
+    return true;
   }
 
   #reap() {
     const now = this.now();
     for (const [key, entry] of this.entries) {
       if (entry.state === "settled" && entry.expiresAt <= now) {
-        this.entries.delete(key);
+        this.#delete(key);
       }
     }
   }
@@ -1038,6 +1156,7 @@ async function handleMcp({ req, res, parsed, config, auth }) {
           hash: toolCallHash(message),
           subject,
           sessionId,
+          replaySensitive: WRITE_TOOLS.has(name),
           signal: requestWait.signal,
           start: async (signal) => {
             const timeoutMs = Math.min(config.mcpWaitMs, config.queue.jobTtlMs);
@@ -1119,17 +1238,34 @@ async function handleAgent({ req, res, url, parsed, config, monitor, auth }) {
       0,
       Math.min(Number.parseInt(parsed?.maxWaitMs ?? String(config.agentPollMs), 10), config.agentPollMs),
     );
-    const job = await config.queue.waitForClaimable({
-      timeoutMs: waitMs,
-      leaseOwner: auth.keyId,
-    });
-    if (!job) {
-      res.writeHead(204, { "cache-control": "no-store" });
-      res.end();
+    const claimWait = disconnectSignal(req, res);
+    try {
+      let job;
+      try {
+        job = await config.queue.waitForClaimable({
+          timeoutMs: waitMs,
+          leaseOwner: auth.keyId,
+          signal: claimWait.signal,
+        });
+      } catch (error) {
+        if (claimWait.signal.aborted) {
+          return;
+        }
+        throw error;
+      }
+      if (claimWait.signal.aborted) {
+        return;
+      }
+      if (!job) {
+        res.writeHead(204, { "cache-control": "no-store" });
+        res.end();
+        return;
+      }
+      json(res, 200, { job, resultSubmission: config.resultSubmission });
       return;
+    } finally {
+      claimWait.cleanup();
     }
-    json(res, 200, { job, resultSubmission: config.resultSubmission });
-    return;
   }
 
   const jobId = parsed?.jobId;

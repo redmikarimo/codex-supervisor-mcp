@@ -66,6 +66,18 @@ function isTerminalEvent(event) {
   );
 }
 
+function rememberTurnStart(store, threadId, turnId, startedAt) {
+  const existing = store.turnStartRecords.get(turnId);
+  store.turnStartRecords.delete(turnId);
+  store.turnStartRecords.set(turnId, {
+    threadId,
+    startedAt: startedAt ?? existing?.startedAt ?? null,
+  });
+  while (store.turnStartRecords.size > store.eventLimit) {
+    store.turnStartRecords.delete(store.turnStartRecords.keys().next().value);
+  }
+}
+
 function stopReason(events) {
   const lastStop = [...events].reverse().find(isTerminalEvent);
   if (!lastStop) {
@@ -87,6 +99,7 @@ export class EventStore {
     this.events = [];
     this.activeTurns = new Map();
     this.turnThreads = new Map();
+    this.turnStartRecords = new Map();
     this.threadStatuses = new Map();
     this.latestDiffs = new Map();
     this.latestAgentMessageRecords = new Map();
@@ -101,6 +114,7 @@ export class EventStore {
     }
     this.turnThreads.set(turn.id, threadId);
     this.activeTurns.set(threadId, turn.id);
+    rememberTurnStart(this, threadId, turn.id, turn.startedAt);
   }
 
   recordProcessFailure(error) {
@@ -114,6 +128,7 @@ export class EventStore {
     this.pendingRequests.clear();
     this.activeTurns.clear();
     this.turnThreads.clear();
+    this.turnStartRecords.clear();
 
     const failure = {
       type: error?.name ?? "AppServerError",
@@ -150,6 +165,12 @@ export class EventStore {
 
     if (method === "turn/started" && threadId && turnId) {
       this.activeTurns.set(threadId, turnId);
+      rememberTurnStart(
+        this,
+        threadId,
+        turnId,
+        params?.turn?.startedAt ?? params?.startedAt,
+      );
     } else if (method === "turn/completed" && threadId) {
       const activeTurnId = this.activeTurns.get(threadId);
       if (!turnId || !activeTurnId || activeTurnId === turnId) {
@@ -177,6 +198,7 @@ export class EventStore {
       this.latestAgentMessageRecords.set(threadId, {
         text: appendBounded(current, params.delta),
         turnId,
+        turnStartedAt: this.turnStartRecords.get(turnId)?.startedAt ?? null,
         itemId,
         phase: params?.phase ?? null,
         complete: false,
@@ -198,6 +220,7 @@ export class EventStore {
       this.latestAgentMessageRecords.set(threadId, {
         text: normalizeAgentMessageText(params.item.text),
         turnId,
+        turnStartedAt: this.turnStartRecords.get(turnId)?.startedAt ?? null,
         itemId: params.item.id ?? null,
         phase,
         complete:

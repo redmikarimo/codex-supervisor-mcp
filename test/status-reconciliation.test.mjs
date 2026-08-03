@@ -7,7 +7,13 @@ import test from "node:test";
 import { EventStore } from "../src/event-store.mjs";
 import { PathPolicy } from "../src/security.mjs";
 import { CodexSupervisorService } from "../src/supervisor-service.mjs";
+import {
+  boundStatusResult,
+  MAX_THREAD_PAGE_BYTES,
+  TOOL_RESULT_BYTE_BASIS,
+} from "../src/thread-pagination.mjs";
 import { MAX_RECONCILED_AGENT_TEXT } from "../src/thread-transcript.mjs";
+import { measureToolResultEnvelopeBytes } from "../src/tool-result.mjs";
 
 const SNAPSHOT_38 =
   "Development snapshot: 38 tests pass and browser integration is incomplete.";
@@ -25,20 +31,39 @@ function agentItem(id, text, extra = {}) {
   };
 }
 
-function completedTurn(id, text, { itemId = `item-${id}`, items = undefined } = {}) {
+function completedTurn(
+  id,
+  text,
+  {
+    itemId = `item-${id}`,
+    items = undefined,
+    startedAt = null,
+    completedAt = null,
+  } = {},
+) {
   return {
     id,
     status: "completed",
-    startedAt: null,
-    completedAt: null,
+    startedAt,
+    completedAt,
     durationMs: null,
     items: items ?? [agentItem(itemId, text)],
     error: null,
   };
 }
 
-function recordLiveCompletion(store, threadId, turnId, text) {
-  store.recordTurnStart(threadId, { id: turnId, status: "inProgress" });
+function recordLiveCompletion(
+  store,
+  threadId,
+  turnId,
+  text,
+  { startedAt = null } = {},
+) {
+  store.recordTurnStart(threadId, {
+    id: turnId,
+    status: "inProgress",
+    startedAt,
+  });
   store.record("item/completed", {
     threadId,
     turnId,
@@ -85,15 +110,41 @@ class PersistedThreadClient {
 
   async request(method, params = {}) {
     this.calls.push({ method, params: structuredClone(params) });
-    if (method !== "thread/read") {
-      throw new Error(`Unexpected method: ${method}`);
+    if (method === "thread/read") {
+      const thread = structuredClone(this.thread);
+      if (!params.includeTurns) {
+        delete thread.turns;
+      }
+      return { thread };
     }
-
-    const thread = structuredClone(this.thread);
-    if (!params.includeTurns) {
-      delete thread.turns;
+    if (method === "thread/turns/list") {
+      const source = structuredClone(this.thread.turns ?? []);
+      if (params.sortDirection === "desc") {
+        source.reverse();
+      }
+      const anchor = /^anchor:(\d+)$/.exec(params.cursor ?? "");
+      const offset = anchor
+        ? Number.parseInt(anchor[1], 10)
+        : Number.parseInt(params.cursor ?? "0", 10);
+      const limit = params.limit ?? source.length;
+      const data = source.slice(offset, offset + limit).map((turn) =>
+        params.itemsView === "notLoaded" ? { ...turn, items: [] } : turn,
+      );
+      const nextOffset = offset + data.length;
+      const originalIndex =
+        params.sortDirection === "desc"
+          ? source.length - 1 - offset
+          : offset;
+      return {
+        data,
+        nextCursor: nextOffset < source.length ? String(nextOffset) : null,
+        backwardsCursor: data.length > 0 ? `anchor:${originalIndex}` : null,
+      };
     }
-    return { thread };
+    if (method === "thread/items/list") {
+      throw new Error("thread/items/list is not supported yet");
+    }
+    throw new Error(`Unexpected method: ${method}`);
   }
 
   describe() {
@@ -138,10 +189,16 @@ test("status reconciles a cache populated before a synthesized rollout is append
   assert.equal(before.latestAgentMessage, SNAPSHOT_38);
   assert.equal("turns" in before.thread, false);
   assert.equal(eventStore.sequence, beforeSequence);
-  assert.deepEqual(client.calls.at(-1), {
+  assert.deepEqual(client.calls[0], {
     method: "thread/read",
-    params: { threadId: thread.id, includeTurns: true },
+    params: { threadId: thread.id, includeTurns: false },
   });
+  assert.equal(
+    client.calls.some(
+      (call) => call.method === "thread/read" && call.params.includeTurns === true,
+    ),
+    false,
+  );
 
   thread.turns.push(completedTurn("rollout-689", COMPLETION_43, { itemId: "item-44" }));
   thread.updatedAt = 101;
@@ -404,6 +461,395 @@ test("status preserves live precedence and control state while reconciling persi
   assert.deepEqual(externalActive.status, { type: "active" });
 });
 
+test("aggregate active status clears stale EventStore ids for every terminal turn state", async (t) => {
+  for (const terminalStatus of ["completed", "interrupted", "failed"]) {
+    await t.test(terminalStatus, async (subtest) => {
+      const harness = await createHarness(subtest);
+      const { eventStore, service, thread } = harness;
+      thread.status = { type: "active" };
+      thread.turns.push({
+        id: `stale-${terminalStatus}`,
+        status: terminalStatus,
+        items: [],
+        error: terminalStatus === "failed" ? { message: "expected" } : null,
+      });
+      thread.turns.push({
+        id: `external-active-${terminalStatus}`,
+        status: "inProgress",
+        items: [],
+        error: null,
+      });
+      eventStore.recordTurnStart(thread.id, {
+        id: `stale-${terminalStatus}`,
+        status: "inProgress",
+      });
+
+      const status = await service.status({ threadId: thread.id });
+      assert.equal(status.activeTurnId, null);
+      assert.deepEqual(status.status, { type: "active" });
+      assert.equal(status.latestAgentMessage, SNAPSHOT_38);
+    });
+  }
+});
+
+test("an old live completion beyond the status window cannot override a newer final", async (t) => {
+  const oldText = "Old EventStore completion.";
+  const newestText = "Newest persisted completion.";
+  const turns = [
+    completedTurn("turn-old-live", oldText, {
+      startedAt: 100,
+      completedAt: 101,
+    }),
+  ];
+  for (let index = 0; index < 20; index += 1) {
+    turns.push(
+      completedTurn(
+        `turn-newer-${index}`,
+        index === 19 ? newestText : `Newer completion ${index}.`,
+        { startedAt: 1_000 + index, completedAt: 1_001 + index },
+      ),
+    );
+  }
+  const thread = {
+    id: "thread-old-live-record",
+    status: { type: "idle" },
+    updatedAt: 500,
+    turns,
+  };
+  const harness = await createHarness(t, { thread });
+  recordLiveCompletion(
+    harness.eventStore,
+    thread.id,
+    "turn-old-live",
+    oldText,
+    { startedAt: 100 },
+  );
+
+  const status = await harness.service.status({ threadId: thread.id });
+  assert.equal(status.latestAgentMessage, newestText);
+  const metadataCalls = harness.client.calls.filter(
+    (call) =>
+      call.method === "thread/turns/list" &&
+      call.params.sortDirection === "desc" &&
+      call.params.itemsView === "notLoaded",
+  );
+  const fullCalls = harness.client.calls.filter(
+    (call) =>
+      call.method === "thread/turns/list" &&
+      call.params.sortDirection === "asc" &&
+      call.params.itemsView === "full",
+  );
+  assert.equal(metadataCalls.length, 16);
+  assert.equal(fullCalls.length, 1);
+  assert.equal(fullCalls[0].params.limit, 1);
+  assert.equal(
+    harness.client.calls.some((call) => call.method === "thread/items/list"),
+    false,
+  );
+});
+
+test("a just-completed live turn wins while its item precedes visible turn metadata", async (t) => {
+  const turns = Array.from({ length: 16 }, (_, index) =>
+    completedTurn(`turn-older-visible-${index}`, `Older final ${index}.`, {
+      startedAt: 100 + index,
+      completedAt: 101 + index,
+    }),
+  );
+  const thread = {
+    id: "thread-turn-metadata-lag",
+    status: { type: "idle" },
+    updatedAt: 550,
+    turns,
+  };
+  const harness = await createHarness(t, { thread });
+  const liveText = "Newest live final with item-only persistence.";
+  harness.eventStore.recordTurnStart(thread.id, {
+    id: "turn-metadata-lag",
+    status: "inProgress",
+    startedAt: 1_000,
+  });
+  const liveItem = agentItem("item-metadata-lag", liveText);
+  harness.eventStore.record("item/completed", {
+    threadId: thread.id,
+    turnId: "turn-metadata-lag",
+    item: liveItem,
+  });
+  harness.eventStore.record("turn/completed", {
+    threadId: thread.id,
+    turn: { id: "turn-metadata-lag", status: "completed", items: [] },
+  });
+
+  const status = await harness.service.status({ threadId: thread.id });
+  assert.equal(status.activeTurnId, null);
+  assert.equal(status.latestAgentMessage, liveText);
+  assert.equal(
+    harness.client.calls.some(
+      (call) =>
+        call.method === "thread/items/list" &&
+        call.params.turnId === "turn-metadata-lag",
+    ),
+    false,
+  );
+});
+
+test("ambiguous absent turn ordering conservatively preserves the live final", async (t) => {
+  const thread = {
+    id: "thread-ambiguous-live-order",
+    status: { type: "idle" },
+    updatedAt: 575,
+    turns: Array.from({ length: 16 }, (_, index) =>
+      completedTurn(`opaque-older-${index}`, `Visible completion ${index}.`),
+    ),
+  };
+  const harness = await createHarness(t, { thread });
+  const liveText = "Ambiguous item-only live final.";
+  harness.eventStore.recordTurnStart(thread.id, {
+    id: "opaque-live-turn",
+    status: "inProgress",
+  });
+  const liveItem = agentItem("opaque-live-item", liveText);
+  harness.eventStore.record("item/completed", {
+    threadId: thread.id,
+    turnId: "opaque-live-turn",
+    item: liveItem,
+  });
+  harness.eventStore.record("turn/completed", {
+    threadId: thread.id,
+    turn: { id: "opaque-live-turn", status: "completed", items: [] },
+  });
+
+  const status = await harness.service.status({ threadId: thread.id });
+  assert.equal(status.latestAgentMessage, liveText);
+  assert.equal(
+    harness.client.calls.some(
+      (call) =>
+        call.method === "thread/items/list" &&
+        call.params.turnId === "opaque-live-turn",
+    ),
+    false,
+  );
+});
+
+test("an authoritative completed full turn supersedes stale live text from the same turn", async (t) => {
+  const persistedText = "Authoritative persisted final for this turn.";
+  const thread = {
+    id: "thread-same-turn-final-refresh",
+    status: { type: "idle" },
+    updatedAt: 590,
+    turns: [completedTurn("turn-same-id", persistedText)],
+  };
+  const harness = await createHarness(t, { thread });
+  harness.eventStore.recordTurnStart(thread.id, {
+    id: "turn-same-id",
+    status: "inProgress",
+  });
+  harness.eventStore.record("item/completed", {
+    threadId: thread.id,
+    turnId: "turn-same-id",
+    item: agentItem("stale-live-item", "Stale live wording."),
+  });
+
+  const status = await harness.service.status({ threadId: thread.id });
+  assert.equal(status.activeTurnId, null);
+  assert.equal(status.latestAgentMessage, persistedText);
+  assert.equal(
+    harness.client.calls.some((call) => call.method === "thread/items/list"),
+    false,
+  );
+});
+
+test("status fails closed when a native hydration anchor returns a different turn", async (t) => {
+  const harness = await createHarness(t);
+  const request = harness.client.request.bind(harness.client);
+  harness.client.request = async (method, params = {}) => {
+    if (
+      method === "thread/turns/list" &&
+      params.sortDirection === "asc" &&
+      params.itemsView === "full"
+    ) {
+      harness.client.calls.push({ method, params: structuredClone(params) });
+      return {
+        data: [completedTurn("wrong-anchor-turn", "Wrong final")],
+        nextCursor: null,
+        backwardsCursor: null,
+      };
+    }
+    return await request(method, params);
+  };
+
+  await assert.rejects(
+    () => harness.service.status({ threadId: harness.thread.id }),
+    /mismatched full turn for status anchor/,
+  );
+  assert.equal(
+    harness.client.calls.some((call) => call.method === "thread/items/list"),
+    false,
+  );
+});
+
+test("an in-progress persisted turn with a final-looking item does not supersede its live completion", async (t) => {
+  const liveText = "Live completion awaiting terminal turn persistence.";
+  const thread = {
+    id: "thread-in-progress-final-item",
+    status: { type: "active" },
+    updatedAt: 600,
+    turns: [
+      completedTurn("turn-prior", "Prior persisted completion."),
+      {
+        id: "turn-current",
+        status: "inProgress",
+        items: [agentItem("item-current", liveText)],
+        error: null,
+      },
+    ],
+  };
+  const harness = await createHarness(t, { thread });
+  harness.eventStore.recordTurnStart(thread.id, {
+    id: "turn-current",
+    status: "inProgress",
+  });
+  harness.eventStore.record("item/completed", {
+    threadId: thread.id,
+    turnId: "turn-current",
+    item: agentItem("item-current", liveText),
+  });
+
+  const status = await harness.service.status({ threadId: thread.id });
+  assert.equal(status.activeTurnId, "turn-current");
+  assert.equal(status.latestAgentMessage, liveText);
+  assert.equal(
+    harness.client.calls.some(
+      (call) =>
+        call.method === "thread/items/list" &&
+        call.params.turnId === "turn-current",
+    ),
+    false,
+  );
+});
+
+test("authoritative interrupted and failed turns suppress completed live-item text", async (t) => {
+  for (const terminalStatus of ["interrupted", "failed"]) {
+    await t.test(terminalStatus, async (subtest) => {
+      const liveText = `Invalid ${terminalStatus} live final.`;
+      const thread = {
+        id: `thread-suppress-${terminalStatus}`,
+        status: { type: "idle" },
+        updatedAt: 625,
+        turns: [
+          completedTurn("turn-prior-valid", "Prior valid persisted final."),
+          {
+            id: "turn-terminal-live",
+            status: terminalStatus,
+            items: [agentItem("item-terminal-live", liveText)],
+            error: terminalStatus === "failed" ? { message: "expected" } : null,
+          },
+        ],
+      };
+      const harness = await createHarness(subtest, { thread });
+      harness.eventStore.recordTurnStart(thread.id, {
+        id: "turn-terminal-live",
+        status: "inProgress",
+      });
+      harness.eventStore.record("item/completed", {
+        threadId: thread.id,
+        turnId: "turn-terminal-live",
+        item: agentItem("item-terminal-live", liveText),
+      });
+
+      const status = await harness.service.status({ threadId: thread.id });
+      assert.equal(status.activeTurnId, null);
+      assert.equal(status.latestAgentMessage, "Prior valid persisted final.");
+    });
+  }
+});
+
+test("an active full status window does not fabricate an absent newer live turn as completed", async (t) => {
+  const turns = Array.from({ length: 16 }, (_, index) =>
+    completedTurn(`turn-older-${index}`, `Older persisted completion ${index}.`),
+  );
+  const thread = {
+    id: "thread-active-absent-live",
+    status: { type: "active" },
+    updatedAt: 650,
+    turns,
+  };
+  const harness = await createHarness(t, { thread });
+  const liveText = "New live final whose turn is not persisted yet.";
+  harness.eventStore.recordTurnStart(thread.id, {
+    id: "turn-new-live",
+    status: "inProgress",
+  });
+  harness.eventStore.record("item/completed", {
+    threadId: thread.id,
+    turnId: "turn-new-live",
+    item: agentItem("item-new-live", liveText),
+  });
+
+  const status = await harness.service.status({ threadId: thread.id });
+  assert.equal(status.activeTurnId, "turn-new-live");
+  assert.equal(status.latestAgentMessage, liveText);
+  assert.equal(
+    harness.client.calls.some(
+      (call) =>
+        call.method === "thread/items/list" &&
+        call.params.turnId === "turn-new-live",
+    ),
+    false,
+  );
+});
+
+test("bounded status finds finals anywhere in a hydrated turn after malformed tails", async (t) => {
+  for (const descendingPosition of [1, 16]) {
+    await t.test(`position-${descendingPosition}`, async (subtest) => {
+      const items = Array.from({ length: 16 }, (_, index) => ({
+        type: "toolOutput",
+        id: `tool-${index}`,
+        text: `tool output ${index}`,
+      }));
+      const itemIndex = items.length - descendingPosition;
+      items[itemIndex] = agentItem(
+        `final-${descendingPosition}`,
+        `Expected final at descending position ${descendingPosition}.`,
+      );
+      const thread = {
+        id: `thread-final-position-${descendingPosition}`,
+        status: { type: "idle" },
+        updatedAt: 700 + descendingPosition,
+        turns: [
+          completedTurn(`turn-target-${descendingPosition}`, "unused", { items }),
+          completedTurn("turn-malformed-tail", "unused", {
+            items: [
+              agentItem("commentary-tail", "Ignored commentary", {
+                phase: "commentary",
+              }),
+              { type: "agentMessage", id: "missing-text", phase: "final_answer" },
+            ],
+          }),
+        ],
+      };
+      const harness = await createHarness(subtest, { thread });
+
+      const status = await harness.service.status({ threadId: thread.id });
+      assert.equal(
+        status.latestAgentMessage,
+        `Expected final at descending position ${descendingPosition}.`,
+      );
+      const fullCalls = harness.client.calls.filter(
+        (call) =>
+          call.method === "thread/turns/list" &&
+          call.params.sortDirection === "asc" &&
+          call.params.itemsView === "full",
+      );
+      assert.equal(fullCalls.length, 2);
+      assert.ok(fullCalls.every((call) => call.params.limit === 1));
+      assert.equal(
+        harness.client.calls.some((call) => call.method === "thread/items/list"),
+        false,
+      );
+    });
+  }
+});
+
 test("status bounds persisted responses and recognizes their bounded live representation", async (t) => {
   const hugeCompletion = `${"x".repeat(MAX_RECONCILED_AGENT_TEXT + 1_000)}FINAL`;
   const thread = {
@@ -461,4 +907,140 @@ test("status reconciliation does not synthesize a terminal event or wake an ordi
   const completed = await waiting;
   assert.equal(completed.reason, "completed");
   assert.equal(completed.latestAgentMessage, "Ordinary wait completion.");
+});
+
+test("compact status stays below the result budget while preserving approval identities", () => {
+  const finalText = "🫁".repeat(MAX_RECONCILED_AGENT_TEXT);
+  const pendingRequests = Array.from({ length: 4 }, (_, index) => ({
+    requestKey: `request-${index}`,
+    id: `approval-${index}`,
+    method: "item/commandExecution/requestApproval",
+    threadId: "thread-status-boundary",
+    turnId: "turn-active",
+    receivedAt: `2026-08-02T00:00:0${index}.000Z`,
+    params: {
+      availableDecisions: ["accept", "cancel"],
+      command: "氧".repeat(150_000),
+    },
+  }));
+  const bounded = boundStatusResult({
+    thread: {
+      id: "thread-status-boundary",
+      cwd: "C:\\allowed",
+      status: { type: "active" },
+    },
+    threadId: "thread-status-boundary",
+    activeTurnId: "turn-active",
+    latestAgentMessage: finalText,
+    latestDiff: { text: "δ".repeat(250_000) },
+    latestError: { message: "錯".repeat(250_000) },
+    pendingRequests,
+    events: Array.from({ length: 5 }, (_, index) => ({
+      sequence: index + 1,
+      payload: "é".repeat(100_000),
+    })),
+    eventCursor: 5,
+    appServer: { state: "ready" },
+  });
+
+  const modernBytes = measureToolResultEnvelopeBytes(bounded, { isModern: true });
+  const legacyBytes = measureToolResultEnvelopeBytes(bounded, { isModern: false });
+  assert.equal(bounded.responseByteBasis, TOOL_RESULT_BYTE_BASIS);
+  assert.ok(modernBytes <= MAX_THREAD_PAGE_BYTES);
+  assert.ok(legacyBytes <= MAX_THREAD_PAGE_BYTES);
+  assert.equal(
+    bounded.responseBytes,
+    modernBytes,
+  );
+  assert.equal(bounded.latestAgentMessage, finalText);
+  assert.deepEqual(
+    bounded.pendingRequests.map((request) => request.requestKey),
+    pendingRequests.map((request) => request.requestKey),
+  );
+  assert.ok(bounded.eventsTruncated > 0);
+});
+
+test("status overflow compacts and deterministically truncates many small approvals", () => {
+  const total = 400;
+  const bounded = boundStatusResult(
+    {
+      thread: { id: "thread-many-approvals", cwd: "C:\\allowed" },
+      latestAgentMessage: "Newest final",
+      latestDiff: null,
+      latestError: null,
+      pendingRequests: Array.from({ length: total }, (_, index) => ({
+        requestKey: `number:${index}`,
+        requestId: index,
+        method: "item/commandExecution/requestApproval",
+        threadId: "thread-many-approvals",
+        turnId: "turn-active",
+        receivedAt: `2026-08-02T00:00:${String(index % 60).padStart(2, "0")}.000Z`,
+        params: {
+          availableDecisions: ["accept", "cancel"],
+          command: `command-${index}-${"x".repeat(100)}`,
+        },
+      })),
+      events: [],
+      eventCursor: 0,
+      appServer: { state: "ready" },
+    },
+    50_000,
+  );
+
+  assert.ok(measureToolResultEnvelopeBytes(bounded, { isModern: true }) <= 50_000);
+  assert.equal(bounded.pendingRequestsTotal, total);
+  assert.equal(
+    bounded.pendingRequestsReturned + bounded.pendingRequestsTruncated,
+    total,
+  );
+  assert.ok(bounded.pendingRequestsTruncated > 0);
+  assert.deepEqual(
+    bounded.pendingRequests.map((request) => request.requestId),
+    Array.from({ length: bounded.pendingRequestsReturned }, (_, index) => index),
+  );
+  assert.ok(
+    bounded.pendingRequests.every(
+      (request) => request.requestKey && request.method && request.params.truncated,
+    ),
+  );
+});
+
+test("status bulk-trims 200 large events to the newest bounded suffix", () => {
+  const events = Array.from({ length: 200 }, (_, index) => ({
+    sequence: index + 1,
+    payload: "x".repeat(96_000),
+  }));
+  let measureCalls = 0;
+  const measureEnvelope = (output, options) => {
+    measureCalls += 1;
+    return measureToolResultEnvelopeBytes(output, options);
+  };
+
+  const bounded = boundStatusResult(
+    {
+      thread: { id: "thread-event-suffix", cwd: "C:\\allowed" },
+      latestAgentMessage: "Newest final",
+      latestDiff: null,
+      latestError: null,
+      pendingRequests: [],
+      events,
+      eventCursor: 200,
+      appServer: { state: "ready" },
+    },
+    MAX_THREAD_PAGE_BYTES,
+    { measureEnvelope },
+  );
+
+  assert.ok(measureCalls <= 30, `expected at most 30 measurements, received ${measureCalls}`);
+  assert.equal(bounded.events.length, 15);
+  assert.equal(bounded.eventsTruncated, 185);
+  assert.deepEqual(
+    bounded.events.map((event) => event.sequence),
+    Array.from({ length: 15 }, (_, index) => 186 + index),
+  );
+  assert.equal(
+    bounded.responseBytes,
+    measureToolResultEnvelopeBytes(bounded, { isModern: true }),
+  );
+  assert.ok(bounded.responseBytes <= MAX_THREAD_PAGE_BYTES);
 });

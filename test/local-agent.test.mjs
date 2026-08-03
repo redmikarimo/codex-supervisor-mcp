@@ -13,6 +13,7 @@ import {
   ResultSubmissionAssembler,
 } from "../src/relay-result-protocol.mjs";
 import { AppServerError } from "../src/errors.mjs";
+import { measureCompleteToolResultEnvelopeBytes } from "../src/tool-result.mjs";
 
 const CAPABILITY = {
   preferredProtocol: RESULT_SUBMISSION_PROTOCOL,
@@ -93,6 +94,42 @@ test("local agent sanitizes AppServerError fields and structured data", async ()
     "[REDACTED]",
   );
   assert.equal(result.structuredContent.error.data["x-api-key"], "[REDACTED]");
+});
+
+test("local agent keeps a large structured result while using the shared compact text stub", async () => {
+  const output = { transcript: "結果🔐".repeat(4_000) };
+  const submissions = [];
+  const agent = new LocalRelayAgent({
+    service: { async close() {} },
+    tools: {
+      has() {
+        return true;
+      },
+      async call() {
+        return output;
+      },
+    },
+    pathPolicy: { async resolveCwd() {} },
+    submit: async (_job, payload) => submissions.push(payload),
+  });
+
+  await agent.handleJob(
+    {
+      id: "compact-large-result",
+      leaseId: "compact-large-result-lease",
+      deliveryCount: 1,
+      toolName: "codex_read_thread",
+      arguments: {},
+    },
+    CAPABILITY,
+  );
+
+  assert.equal(submissions.length, 1);
+  const result = submissions[0].result;
+  assert.equal(result.isError, false);
+  assert.match(result.content[0].text, /^Structured result available \(\d+ bytes\)\.$/);
+  assert.strictEqual(result.structuredContent, output);
+  assert.ok(measureCompleteToolResultEnvelopeBytes(result) <= 64 * 1024);
 });
 
 test("result capability negotiation derives limits from the final clamped values", () => {

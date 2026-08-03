@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 const installerUrl = new URL("../scripts/install-local-agent.ps1", import.meta.url);
+const launcherUrl = new URL("../scripts/McpServerLauncher.cs", import.meta.url);
+const iconSourceUrl = new URL("../scripts/McpServerIcon.png.base64", import.meta.url);
 
 test("local-agent installer registers a least-privilege Windows task", async () => {
   const installer = await readFile(installerUrl, "utf8");
@@ -10,8 +13,10 @@ test("local-agent installer registers a least-privilege Windows task", async () 
   assert.match(installer, /New-ScheduledTaskPrincipal[^\r\n]+-RunLevel Limited/);
   assert.doesNotMatch(installer, /-RunLevel LeastPrivilege/);
   assert.doesNotMatch(installer, /BIOTELE_RELAY_AGENT_SECRET[^\r\n]+New-ScheduledTaskAction/);
-  assert.match(installer, /GetEnvironmentVariable\(`\$name, 'User'\)/);
-  assert.match(installer, /-WindowStyle Hidden[^\r\n]+-EncodedCommand/);
+  assert.match(installer, /New-ScheduledTaskAction\s+`[\s\S]+?-Execute \$mcpServerLauncher/);
+  assert.match(installer, /-Argument \$launcherArguments/);
+  assert.doesNotMatch(installer, /New-ScheduledTaskAction[^\r\n]+powershell\.exe/i);
+  assert.doesNotMatch(installer, /EncodedCommand/);
   assert.match(installer, /New-ScheduledTaskSettingsSet[^\r\n]+-RestartCount 3[^\r\n]+-RestartInterval/);
   assert.match(installer, /Register-ScheduledTask[^\r\n]+-Settings \$settings/);
   assert.match(installer, /Register-ScheduledTask[^\r\n]+-ErrorAction Stop/);
@@ -26,7 +31,6 @@ test("local-agent installer registers a least-privilege Windows task", async () 
   assert.match(installer, /SetEnvironmentVariable\(\$entry\.Key, \$entry\.Value, 'Process'\)/);
   assert.match(installer, /CODEX_BIN = \$nativeCodex/);
   assert.match(installer, /CODEX_APP_SERVER_ARGS = \$appServerArgs/);
-  assert.match(installer, /'CODEX_BIN',[\s\S]+?'CODEX_APP_SERVER_ARGS'/);
   assert.match(installer, /mcp_servers\.codex-supervisor\.enabled=false/);
   assert.match(
     installer,
@@ -43,4 +47,39 @@ test("local-agent installer registers a least-privilege Windows task", async () 
   assert.match(installer, /-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries/);
   assert.match(installer, /Controlled handoff/);
   assert.match(installer, /Start manually with: Set-Location -LiteralPath/);
+  assert.match(installer, /Install-McpServerLauncher/);
+  assert.match(installer, /Install-McpServerIcon/);
+  assert.match(installer, /'MCP Server\.exe'/);
+  assert.match(installer, /\/target:winexe/);
+  assert.match(installer, /\/win32icon:\$\(\$icon\.Path\)/);
+  assert.match(installer, /CDB4785CA8EA328B1E88B50B67D12E0A3D86D4039664C1F93BFEDBB2BE63CA46/);
+});
+
+test("MCP Server launcher loads HKCU settings and kills its hidden Node child on exit", async () => {
+  const launcher = await readFile(launcherUrl, "utf8");
+
+  assert.match(launcher, /AssemblyTitle\("MCP Server"\)/);
+  assert.match(launcher, /AssemblyProduct\("MCP Server"\)/);
+  assert.match(launcher, /JobObjectLimitKillOnJobClose\s*=\s*0x00002000/);
+  assert.match(launcher, /AssignProcessToJobObject/);
+  assert.match(launcher, /CreateNoWindow\s*=\s*true/);
+  assert.match(launcher, /Registry\.CurrentUser\.OpenSubKey\("Environment", false\)/);
+  assert.match(launcher, /EnvironmentVariableTarget\.Process/);
+  assert.match(launcher, /BIOTELE_RELAY_AGENT_SECRET/);
+  assert.match(launcher, /LoadRequiredUserEnvironment\(\);[\s\S]+?Process\.Start/);
+  assert.doesNotMatch(launcher, /Console\.(?:Error\.)?WriteLine\([^\r\n]*value/);
+});
+
+test("MCP Server icon source is the exact approved PNG", async () => {
+  const encoded = (await readFile(iconSourceUrl, "utf8")).replace(/\s/g, "");
+  const png = Buffer.from(encoded, "base64");
+
+  assert.equal(png.length, 5_850);
+  assert.equal(
+    createHash("sha256").update(png).digest("hex").toUpperCase(),
+    "CDB4785CA8EA328B1E88B50B67D12E0A3D86D4039664C1F93BFEDBB2BE63CA46",
+  );
+  assert.equal(png.subarray(0, 8).toString("hex"), "89504e470d0a1a0a");
+  assert.equal(png.readUInt32BE(16), 180);
+  assert.equal(png.readUInt32BE(20), 180);
 });

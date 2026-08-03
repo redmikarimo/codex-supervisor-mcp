@@ -15,6 +15,21 @@ import { EventStore } from "../src/event-store.mjs";
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const mockServer = path.join(currentDirectory, "mock-codex-app-server.mjs");
 
+test("AppServerClient enables the native experimental list API during initialize", async (t) => {
+  const client = new AppServerClient({
+    command: process.execPath,
+    args: [mockServer],
+    eventStore: new EventStore(),
+    requestTimeoutMs: 5_000,
+  });
+  t.after(async () => {
+    await client.stop();
+  });
+
+  const initialize = await client.request("test/initializeParams");
+  assert.deepEqual(initialize.capabilities, { experimentalApi: true });
+});
+
 test("AppServerClient streams completion and resolves approvals", async (t) => {
   const repository = await fs.mkdtemp(path.join(os.tmpdir(), "codex-supervisor-client-"));
   t.after(async () => {

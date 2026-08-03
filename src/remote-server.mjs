@@ -8,6 +8,7 @@ import { sanitizeErrorData, sanitizeErrorText } from "./error-sanitization.mjs";
 import { AppServerError } from "./errors.mjs";
 import { CodexSupervisorService } from "./supervisor-service.mjs";
 import { createToolRegistry } from "./tool-registry.mjs";
+import { completeToolResult } from "./tool-result.mjs";
 
 const VERSION = "1.2.5";
 const DEFAULT_PROTOCOL_VERSION = "2025-11-25";
@@ -441,14 +442,6 @@ async function readBody(req) {
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }
 
-function completeToolResult(output, isError = false) {
-  return {
-    content: [{ type: "text", text: JSON.stringify(output, null, 2) }],
-    structuredContent: output,
-    isError,
-  };
-}
-
 function errorToolResult(error) {
   return completeToolResult(
     {
@@ -464,7 +457,7 @@ function errorToolResult(error) {
           : {}),
       },
     },
-    true,
+    { isError: true },
   );
 }
 

@@ -206,7 +206,7 @@ export class AppServerClient {
             version: "1.0.0",
           },
           capabilities: {
-            experimentalApi: false,
+            experimentalApi: true,
           },
         },
         20_000,

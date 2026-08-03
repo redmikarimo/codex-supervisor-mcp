@@ -13,11 +13,11 @@ The server exposes these MCP tools:
 | `codex_start` | Start a new Codex thread and turn in an allowed repository. |
 | `codex_send` | Send a new instruction after the active turn is idle. |
 | `codex_steer` | Append guidance to the active turn. |
-| `codex_status` | Read thread state, recent events, the latest agent message, diff, and pending requests. |
+| `codex_status` | Read bounded thread state, recent events, the latest persisted agent message, diff, and pending requests. |
 | `codex_wait` | Long-poll until completion, failure, interruption, or an approval request. |
 | `codex_interrupt` | Interrupt an active turn. |
 | `codex_list_threads` | List persisted threads inside configured roots. |
-| `codex_read_thread` | Read a persisted authorized thread. |
+| `codex_read_thread` | Read a compact thread or a stable bounded transcript page. |
 | `codex_list_approvals` | Inspect pending app-server requests. |
 | `codex_resolve_approval` | Accept, decline, or cancel command-execution and file-change approvals. |
 
@@ -265,6 +265,13 @@ Version 1.2.5 also reconciles `codex_status.latestAgentMessage` with the
 authorized persisted transcript. Fully persisted external Codex completions,
 including synthesized `rollout-*` turns, now replace stale bridge-observed
 messages while incomplete or interrupted transcript tails remain excluded.
+
+Large transcripts use chronological `codex_read_thread` pages. With
+`includeTurns=true`, pass each returned `nextCursor` into the next call; every
+modern complete MCP envelope is at most 1,500,000 UTF-8 bytes. Oversized single
+turns use ordered base64url JSON fragments with byte offsets and SHA-256
+integrity metadata. Compact status and transcript snapshots use the installed
+runtime's supported `thread/turns/list` API and never materialize full history.
 
 Deploy the updated relay before updating the Windows agent. The new relay still
 accepts legacy one-shot results, while the new agent uses the chunked format
