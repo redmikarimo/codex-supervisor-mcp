@@ -1,6 +1,11 @@
 import http from "node:http";
 import { createHash, randomUUID } from "node:crypto";
 
+import {
+  REEVES_AGENT_KEY_ID,
+  REEVES_TOOL_DEFINITIONS,
+  routeForAgentKeyId,
+} from "./agent-routing.mjs";
 import { sanitizeErrorData, sanitizeErrorText } from "./error-sanitization.mjs";
 import { TOOL_DEFINITIONS } from "./tool-registry.mjs";
 import {
@@ -43,6 +48,18 @@ const WRITE_TOOLS = new Set([
   "codex_steer",
   "codex_interrupt",
   "codex_resolve_approval",
+  "reeves_tap",
+  "reeves_swipe",
+  "reeves_type",
+  "reeves_back",
+  "reeves_home",
+  "reeves_recents",
+]);
+READ_TOOLS.add("reeves_status");
+READ_TOOLS.add("reeves_screenshot");
+const HOSTED_TOOL_DEFINITIONS = Object.freeze([
+  ...TOOL_DEFINITIONS,
+  ...REEVES_TOOL_DEFINITIONS,
 ]);
 
 function positiveIntegerFromEnv(env, name, defaultValue) {
@@ -83,19 +100,47 @@ function standaloneBase64Secret(value) {
 function agentCredentialsFromEnv(env) {
   const keyId = env.BIOTELE_RELAY_AGENT_KEY_ID;
   const secret = env.BIOTELE_RELAY_AGENT_SECRET;
+  let credentials;
   if (secret !== undefined && String(secret).trim() !== "") {
     const resolvedKeyId = keyId && String(keyId).trim() ? keyId : DEFAULT_AGENT_KEY_ID;
-    return parseCredentialMap(`${resolvedKeyId}:${secret}`, "BIOTELE_RELAY_AGENT_KEY_ID");
-  }
-  if (keyId !== undefined && String(keyId).trim() !== "") {
+    credentials = parseCredentialMap(
+      `${resolvedKeyId}:${secret}`,
+      "BIOTELE_RELAY_AGENT_KEY_ID",
+    );
+  } else if (keyId !== undefined && String(keyId).trim() !== "") {
     throw new Error("BIOTELE_RELAY_AGENT_SECRET is required when BIOTELE_RELAY_AGENT_KEY_ID is set.");
+  } else {
+    const legacy = env.BIOTELE_RELAY_AGENT_KEYS;
+    const standaloneSecret = standaloneBase64Secret(legacy);
+    credentials = parseCredentialMap(
+      standaloneSecret ? `${DEFAULT_AGENT_KEY_ID}:${standaloneSecret}` : legacy,
+      "BIOTELE_RELAY_AGENT_KEYS",
+    );
   }
-  const legacy = env.BIOTELE_RELAY_AGENT_KEYS;
-  const standaloneSecret = standaloneBase64Secret(legacy);
-  return parseCredentialMap(
-    standaloneSecret ? `${DEFAULT_AGENT_KEY_ID}:${standaloneSecret}` : legacy,
-    "BIOTELE_RELAY_AGENT_KEYS",
-  );
+
+  const reevesKeyId = env.BIOTELE_RELAY_REEVES_AGENT_KEY_ID;
+  const reevesSecret = env.BIOTELE_RELAY_REEVES_AGENT_SECRET;
+  const hasReevesKeyId = reevesKeyId !== undefined && String(reevesKeyId).trim() !== "";
+  const hasReevesSecret = reevesSecret !== undefined && String(reevesSecret).trim() !== "";
+  if (hasReevesKeyId && !hasReevesSecret) {
+    throw new Error(
+      "BIOTELE_RELAY_REEVES_AGENT_SECRET is required when BIOTELE_RELAY_REEVES_AGENT_KEY_ID is set.",
+    );
+  }
+  if (hasReevesSecret) {
+    const resolvedReevesKeyId = hasReevesKeyId ? String(reevesKeyId).trim() : REEVES_AGENT_KEY_ID;
+    if (resolvedReevesKeyId !== REEVES_AGENT_KEY_ID) {
+      throw new Error(
+        `BIOTELE_RELAY_REEVES_AGENT_KEY_ID must be ${REEVES_AGENT_KEY_ID}.`,
+      );
+    }
+    const reevesCredentials = parseCredentialMap(
+      `${resolvedReevesKeyId}:${reevesSecret}`,
+      "BIOTELE_RELAY_REEVES_AGENT_KEY_ID",
+    );
+    credentials.set(REEVES_AGENT_KEY_ID, reevesCredentials.get(REEVES_AGENT_KEY_ID));
+  }
+  return credentials;
 }
 
 export function requiredPort(env = process.env) {
@@ -984,7 +1029,7 @@ async function handleMcp({ req, res, parsed, config, auth }) {
           version: VERSION,
         },
         instructions:
-          "This endpoint queues Codex supervisor jobs for an outbound-only local Windows agent. Use allowed roots only; network access remains disabled unless the local agent is explicitly configured otherwise.",
+          "This endpoint routes codex_* jobs to the outbound Windows agent and reeves_* jobs to the authenticated Reeves Android agent. Device-changing Reeves actions and Codex mutations require write scope.",
       };
       break;
 
@@ -999,13 +1044,13 @@ async function handleMcp({ req, res, parsed, config, auth }) {
         json(res, 200, rpcError(message.id, -32001, error.message, { requiredScope: error.scope }));
         return;
       }
-      result = { tools: TOOL_DEFINITIONS };
+      result = { tools: HOSTED_TOOL_DEFINITIONS };
       break;
 
     case "tools/call": {
       const name = message.params?.name;
       const args = message.params?.arguments ?? {};
-      if (!TOOL_DEFINITIONS.some((tool) => tool.name === name)) {
+      if (!HOSTED_TOOL_DEFINITIONS.some((tool) => tool.name === name)) {
         json(res, 200, rpcError(message.id, -32602, `Unknown tool: ${String(name)}`));
         return;
       }
@@ -1122,6 +1167,7 @@ async function handleAgent({ req, res, url, parsed, config, monitor, auth }) {
     const job = await config.queue.waitForClaimable({
       timeoutMs: waitMs,
       leaseOwner: auth.keyId,
+      agentRoute: routeForAgentKeyId(auth.keyId),
     });
     if (!job) {
       res.writeHead(204, { "cache-control": "no-store" });

@@ -1,5 +1,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
 
+import { CODEX_AGENT_ROUTE, isAgentRoute, routeForToolName } from "./agent-routing.mjs";
+
 function shortId() {
   return randomBytes(12).toString("base64url");
 }
@@ -55,6 +57,7 @@ export class RelayQueue {
       id: shortId(),
       requestId,
       toolName,
+      route: routeForToolName(toolName),
       arguments: args ?? {},
       state: "queued",
       createdAt: now,
@@ -73,7 +76,10 @@ export class RelayQueue {
     return job;
   }
 
-  claim({ leaseOwner = undefined } = {}) {
+  claim({ leaseOwner = undefined, agentRoute = CODEX_AGENT_ROUTE } = {}) {
+    if (!isAgentRoute(agentRoute)) {
+      throw new TypeError("Unknown authenticated agent route.");
+    }
     this.#reap();
     const now = this.now();
     for (const job of this.jobs.values()) {
@@ -81,6 +87,9 @@ export class RelayQueue {
         job.state === "queued" ||
         (job.state === "claimed" && job.leasedUntil <= now);
       if (!claimable) {
+        continue;
+      }
+      if (job.route !== agentRoute) {
         continue;
       }
       job.state = "claimed";
@@ -108,17 +117,22 @@ export class RelayQueue {
     return null;
   }
 
-  async waitForClaimable({ timeoutMs = 25_000, signal = undefined, leaseOwner = undefined } = {}) {
+  async waitForClaimable({
+    timeoutMs = 25_000,
+    signal = undefined,
+    leaseOwner = undefined,
+    agentRoute = CODEX_AGENT_ROUTE,
+  } = {}) {
     if (signal?.aborted) {
       throw abortReason(signal, "Claim wait aborted.");
     }
-    const immediate = this.claim({ leaseOwner });
+    const immediate = this.claim({ leaseOwner, agentRoute });
     if (immediate) {
       return immediate;
     }
 
     return await new Promise((resolve, reject) => {
-      const waiter = { resolve, reject, leaseOwner };
+      const waiter = { resolve, reject, leaseOwner, agentRoute };
       const cleanup = () => {
         clearTimeout(timer);
         signal?.removeEventListener("abort", onAbort);
@@ -233,13 +247,18 @@ export class RelayQueue {
   }
 
   #notifyWaiter() {
-    while (this.waiters.length > 0) {
+    const waiterCount = this.waiters.length;
+    for (let index = 0; index < waiterCount; index += 1) {
       const waiter = this.waiters.shift();
-      const claimed = this.claim({ leaseOwner: waiter.leaseOwner });
+      const claimed = this.claim({
+        leaseOwner: waiter.leaseOwner,
+        agentRoute: waiter.agentRoute,
+      });
       if (claimed) {
         waiter.resolve(claimed);
         return;
       }
+      this.waiters.push(waiter);
     }
   }
 
