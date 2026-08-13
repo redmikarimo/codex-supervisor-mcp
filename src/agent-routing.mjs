@@ -1,0 +1,150 @@
+export const CODEX_AGENT_ROUTE = "codex";
+export const REEVES_AGENT_ROUTE = "reeves";
+export const REEVES_AGENT_KEY_ID = "reeves-android-1";
+
+const emptyInputSchema = Object.freeze({
+  type: "object",
+  additionalProperties: false,
+  properties: {},
+});
+
+function annotations({ readOnlyHint, destructiveHint, idempotentHint, openWorldHint }) {
+  return {
+    readOnlyHint,
+    destructiveHint,
+    idempotentHint,
+    openWorldHint,
+  };
+}
+
+const readOnlyAnnotations = annotations({
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
+});
+
+const deviceActionAnnotations = annotations({
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: false,
+  openWorldHint: true,
+});
+
+export const REEVES_TOOL_DEFINITIONS = Object.freeze([
+  {
+    name: "reeves_status",
+    title: "Read Reeves status",
+    description:
+      "Read the Reeves Android agent and accessibility-service status without changing device state.",
+    inputSchema: emptyInputSchema,
+    annotations: readOnlyAnnotations,
+  },
+  {
+    name: "reeves_tap",
+    title: "Tap Android screen",
+    description: "Tap one absolute screen coordinate on the Reeves Android device.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        x: { type: "integer", minimum: 0, description: "Horizontal screen coordinate in pixels." },
+        y: { type: "integer", minimum: 0, description: "Vertical screen coordinate in pixels." },
+      },
+      required: ["x", "y"],
+    },
+    annotations: deviceActionAnnotations,
+  },
+  {
+    name: "reeves_swipe",
+    title: "Swipe Android screen",
+    description: "Swipe between two absolute screen coordinates on the Reeves Android device.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        startX: { type: "integer", minimum: 0, description: "Starting horizontal pixel coordinate." },
+        startY: { type: "integer", minimum: 0, description: "Starting vertical pixel coordinate." },
+        endX: { type: "integer", minimum: 0, description: "Ending horizontal pixel coordinate." },
+        endY: { type: "integer", minimum: 0, description: "Ending vertical pixel coordinate." },
+        durationMs: {
+          type: "integer",
+          minimum: 1,
+          maximum: 10_000,
+          default: 300,
+          description: "Gesture duration in milliseconds.",
+        },
+      },
+      required: ["startX", "startY", "endX", "endY"],
+    },
+    annotations: deviceActionAnnotations,
+  },
+  {
+    name: "reeves_type",
+    title: "Type on Android device",
+    description: "Insert text through the focused control on the Reeves Android device.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        text: {
+          type: "string",
+          minLength: 1,
+          maxLength: 16_384,
+          description: "Text to insert into the currently focused editable control.",
+        },
+      },
+      required: ["text"],
+    },
+    annotations: deviceActionAnnotations,
+  },
+  {
+    name: "reeves_back",
+    title: "Press Android Back",
+    description: "Invoke the Android Back global action on the Reeves device.",
+    inputSchema: emptyInputSchema,
+    annotations: deviceActionAnnotations,
+  },
+  {
+    name: "reeves_home",
+    title: "Press Android Home",
+    description: "Invoke the Android Home global action on the Reeves device.",
+    inputSchema: emptyInputSchema,
+    annotations: deviceActionAnnotations,
+  },
+  {
+    name: "reeves_recents",
+    title: "Open Android Recents",
+    description: "Invoke the Android Recents global action on the Reeves device.",
+    inputSchema: emptyInputSchema,
+    annotations: deviceActionAnnotations,
+  },
+  {
+    name: "reeves_screenshot",
+    title: "Capture Android screenshot",
+    description: "Capture the current Reeves Android display without changing device state.",
+    inputSchema: emptyInputSchema,
+    annotations: readOnlyAnnotations,
+  },
+]);
+
+export function routeForToolName(toolName) {
+  if (typeof toolName !== "string") {
+    throw new TypeError("Relay job toolName must be a string.");
+  }
+  if (toolName.startsWith("codex_")) {
+    return CODEX_AGENT_ROUTE;
+  }
+  if (toolName.startsWith("reeves_")) {
+    return REEVES_AGENT_ROUTE;
+  }
+  throw new TypeError(`Relay job tool namespace is not routable: ${toolName}`);
+}
+
+export function routeForAgentKeyId(keyId) {
+  return keyId === REEVES_AGENT_KEY_ID ? REEVES_AGENT_ROUTE : CODEX_AGENT_ROUTE;
+}
+
+export function isAgentRoute(value) {
+  return value === CODEX_AGENT_ROUTE || value === REEVES_AGENT_ROUTE;
+}

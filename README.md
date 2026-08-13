@@ -245,13 +245,22 @@ repository and validates every task directory against `CODEX_ALLOWED_ROOTS`.
 Version 1.2.5 provides a Hostinger-compatible relay for ChatGPT remote MCP access:
 
 ```text
-ChatGPT -> OAuth bearer JWT -> Hostinger /mcp -> queued job -> outbound Windows local-agent -> Codex app-server
+ChatGPT -> OAuth bearer JWT -> Hostinger /mcp -> namespace-routed queue
+  codex_*  -> outbound Windows local-agent -> Codex app-server
+  reeves_* -> outbound Reeves Android agent -> accessibility service
 ```
 
 The public `/mcp` endpoint validates RS256 OAuth access tokens from an external
-identity provider. The Windows local-agent uses separate HMAC credentials only
-for outbound polling, status, lease acquisition, and result submission. The
+identity provider. The Windows and Reeves agents use independent HMAC
+credentials only for outbound polling, status, lease acquisition, and result
+submission. The
 Hostinger relay never starts Codex and never reads local repositories.
+
+The hosted relay keeps all existing `codex_*` tools and additionally exposes
+`reeves_status`, `reeves_tap`, `reeves_swipe`, `reeves_type`, `reeves_back`,
+`reeves_home`, `reeves_recents`, and `reeves_screenshot`. The local STDIO Codex
+registry remains Codex-only. Agent claims are filtered by authenticated key ID;
+client-supplied routing fields are ignored.
 
 This release also negotiates a supported MCP protocol version, issues a bounded
 OAuth-subject-bound session, and requires that session on follow-up requests.
