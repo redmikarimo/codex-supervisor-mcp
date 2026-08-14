@@ -1737,7 +1737,12 @@ test("chunked Reeves screenshot reaches MCP as an image content block", async (t
   const response = await mcpCall;
   assert.equal(response.status, 200);
   const payload = await response.json();
-  assert.deepEqual(payload.result, toolResult);
+  const { timing, ...actualMetadata } = payload.result.structuredContent;
+  assert.deepEqual(
+    { ...payload.result, structuredContent: actualMetadata },
+    toolResult,
+  );
+  assert.ok(timing.relay.totalServerMs >= 0);
   assert.equal(payload.result.content[0].type, "image");
   assert.equal(payload.result.content[0].mimeType, "image/png");
   assert.equal(payload.result.content[0].data, pngBase64);

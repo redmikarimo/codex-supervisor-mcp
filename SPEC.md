@@ -87,6 +87,15 @@ The current pain is uncertainty: a configured plugin may appear connected while 
     agent id. Android uses the relay-advertised chunked result protocol, and
     bounds/downscales PNG output so the complete MCP result remains below
     1,500,000 UTF-8 bytes.
+13. `reeves_sequence` executes one bounded, ordered batch of Android actions
+    locally after a single relay claim. It supports tap, swipe, type, back,
+    home, recents, wait, and explicitly requested screenshots; stops on the
+    first failure by default; returns an indexed result for every attempted
+    action; and captures at most the requested before/after screenshots. The
+    default is no screenshot before and one screenshot after. Relay and agent
+    timestamps expose request-to-queue, queue-to-claim, Android execution,
+    result-submission, and result-to-MCP-return latency without weakening HMAC
+    authentication or opening an inbound Android port.
 
 ## UX Flows
 
@@ -110,6 +119,17 @@ Inspect and operate the Reeves Android display:
 2. Derive absolute coordinates from the returned dimensions.
 3. Call a harmless `reeves_tap` or `reeves_swipe` action.
 4. Call `reeves_screenshot` again and visually confirm the expected change.
+
+Perform a low-latency Reeves workflow:
+
+1. Use one `reeves_sequence` call for coordinates and text already known from
+   the current screen.
+2. Execute the actions locally in order, with explicit waits only where the
+   target UI needs time to settle.
+3. Stop at and report the exact failed action unless the caller explicitly
+   chooses `stopOnError=false`.
+4. Return one final screenshot by default and visually verify the resulting
+   screen before issuing another state-changing batch.
 
 ## Tools and API Design
 
@@ -144,6 +164,11 @@ This is a tool-only conversational app; its outputs are compact structured data 
   PNG data. `structuredContent` contains only compact capture metadata and
   never a sandbox path or duplicate image payload. Android submits the result
   through the relay-advertised chunked HMAC result protocol.
+- `reeves_sequence`: execute 1 through 50 ordered Reeves actions locally with
+  bounded per-action and overall timeouts. `screenshotBefore` defaults false,
+  `screenshotAfter` defaults true, and `stopOnError` defaults true. The result
+  contains indexed per-action status, exact failure metadata, optional MCP
+  image blocks, and secret-free relay/Android timing measurements.
 
 Remote action calls are idempotent within an OAuth-subject-bound MCP session.
 The relay negotiates a supported protocol, requires the issued session on
