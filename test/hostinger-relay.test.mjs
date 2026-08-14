@@ -1638,13 +1638,21 @@ test("chunked Reeves screenshot reaches MCP as an image content block", async (t
   const payload = await response.json();
   const { timing, ...actualMetadata } = payload.result.structuredContent;
   assert.deepEqual(
-    { ...payload.result, structuredContent: actualMetadata },
+    {
+      ...payload.result,
+      content: toolResult.content,
+      structuredContent: actualMetadata,
+    },
     toolResult,
   );
   assert.ok(timing.relay.totalServerMs >= 0);
-  assert.equal(payload.result.content[0].type, "image");
-  assert.equal(payload.result.content[0].mimeType, "image/png");
-  assert.equal(payload.result.content[0].data, pngBase64);
+  assert.deepEqual(JSON.parse(payload.result.content[0].text), {
+    ...metadata,
+    timing,
+  });
+  assert.equal(payload.result.content[1].type, "image");
+  assert.equal(payload.result.content[1].mimeType, "image/png");
+  assert.equal(payload.result.content[1].data, pngBase64);
   assert.equal("path" in payload.result.structuredContent, false);
   assert.equal("data" in payload.result.structuredContent, false);
 });

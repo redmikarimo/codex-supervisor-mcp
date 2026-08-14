@@ -320,19 +320,34 @@ function withRelayTiming(result, relayTiming, mcpReturnedAt) {
     resultToMcpReturnMs: mcpReturnedAt - relayTiming.resultReceivedAt,
     totalServerMs: mcpReturnedAt - relayTiming.mcpReceivedAt,
   };
+  const mergedStructuredContent = {
+    ...structuredContent,
+    timing: {
+      ...(structuredContent.timing &&
+      typeof structuredContent.timing === "object" &&
+      !Array.isArray(structuredContent.timing)
+        ? structuredContent.timing
+        : {}),
+      relay,
+    },
+  };
+  const hasImage =
+    Array.isArray(result.content) &&
+    result.content.some((block) => block?.type === "image");
   return {
     ...result,
-    structuredContent: {
-      ...structuredContent,
-      timing: {
-        ...(structuredContent.timing &&
-        typeof structuredContent.timing === "object" &&
-        !Array.isArray(structuredContent.timing)
-          ? structuredContent.timing
-          : {}),
-        relay,
-      },
-    },
+    ...(hasImage
+      ? {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(mergedStructuredContent, null, 2),
+            },
+            ...result.content.filter((block) => block?.type !== "text"),
+          ],
+        }
+      : {}),
+    structuredContent: mergedStructuredContent,
   };
 }
 
