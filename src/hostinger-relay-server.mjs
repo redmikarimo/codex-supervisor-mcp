@@ -54,6 +54,7 @@ const WRITE_TOOLS = new Set([
   "reeves_back",
   "reeves_home",
   "reeves_recents",
+  "reeves_sequence",
 ]);
 READ_TOOLS.add("reeves_status");
 READ_TOOLS.add("reeves_screenshot");
@@ -292,6 +293,46 @@ function toolErrorResult(error) {
     ],
     structuredContent: { error: safeError },
     isError: true,
+  };
+}
+
+function withRelayTiming(result, relayTiming, mcpReturnedAt) {
+  if (
+    !relayTiming ||
+    !result ||
+    typeof result !== "object" ||
+    Array.isArray(result)
+  ) {
+    return result;
+  }
+  const structuredContent =
+    result.structuredContent &&
+    typeof result.structuredContent === "object" &&
+    !Array.isArray(result.structuredContent)
+      ? result.structuredContent
+      : {};
+  const relay = {
+    ...relayTiming,
+    mcpReturnedAt,
+    requestToQueueMs: relayTiming.queuedAt - relayTiming.mcpReceivedAt,
+    queueToClaimMs: relayTiming.claimedAt - relayTiming.queuedAt,
+    claimToResultMs: relayTiming.resultReceivedAt - relayTiming.claimedAt,
+    resultToMcpReturnMs: mcpReturnedAt - relayTiming.resultReceivedAt,
+    totalServerMs: mcpReturnedAt - relayTiming.mcpReceivedAt,
+  };
+  return {
+    ...result,
+    structuredContent: {
+      ...structuredContent,
+      timing: {
+        ...(structuredContent.timing &&
+        typeof structuredContent.timing === "object" &&
+        !Array.isArray(structuredContent.timing)
+          ? structuredContent.timing
+          : {}),
+        relay,
+      },
+    },
   };
 }
 
@@ -770,6 +811,7 @@ export function createHostingerRelayServer({
   });
 
   const server = http.createServer(async (req, res) => {
+    const requestReceivedAt = Date.now();
     const requestId = req.headers["x-request-id"] ?? randomUUID();
     res.setHeader("x-request-id", requestId);
 
@@ -882,7 +924,7 @@ export function createHostingerRelayServer({
           return;
         }
         const { parsed } = await readBody(req, config.maxBodyBytes);
-        await handleMcp({ req, res, parsed, config, auth });
+        await handleMcp({ req, res, parsed, config, auth, mcpReceivedAt: requestReceivedAt });
         return;
       }
 
@@ -1013,7 +1055,7 @@ export function createHostingerRelayServer({
   return server;
 }
 
-async function handleMcp({ req, res, parsed, config, auth }) {
+async function handleMcp({ req, res, parsed, config, auth, mcpReceivedAt }) {
   const subject = auth.subject;
   if (req.method === "DELETE") {
     try {
@@ -1135,6 +1177,7 @@ async function handleMcp({ req, res, parsed, config, auth }) {
               arguments: args,
               requestId: String(message.id),
               resultTimeoutMs: timeoutMs,
+              mcpReceivedAt,
             });
             return await config.queue.waitForResult(job, {
               timeoutMs,
@@ -1143,6 +1186,9 @@ async function handleMcp({ req, res, parsed, config, auth }) {
           },
         });
         result = outcome.result ?? toolErrorResult(outcome.error);
+        if (name.startsWith("reeves_")) {
+          result = withRelayTiming(result, outcome.relayTiming, Date.now());
+        }
       } catch (error) {
         if (requestWait.signal.aborted) {
           return;

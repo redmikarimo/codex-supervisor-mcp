@@ -9,10 +9,29 @@ The hosted MCP relay exposes the existing `codex_*` tools plus:
 - `reeves_back`
 - `reeves_home`
 - `reeves_recents`
+- `reeves_sequence`
 - `reeves_screenshot`
 
 `reeves_status` and `reeves_screenshot` require the configured MCP read scope.
-The six device-changing tools require the configured MCP write scope.
+The seven device-changing tools, including `reeves_sequence`, require the
+configured MCP write scope.
+
+## Low-latency sequences
+
+`reeves_sequence` enqueues one Reeves-routed job containing 1 through 50
+ordered local actions: tap, swipe, type, Back, Home, Recents, wait, or
+screenshot. It stops on the first failure by default and returns the exact
+failed index and type. `screenshotBefore` defaults to false,
+`screenshotAfter` defaults to true, `stopOnError` defaults to true,
+`perActionTimeoutMs` defaults to 5,000, and `overallTimeoutMs` defaults to
+60,000.
+
+The Android claim request is a 25-second long poll that the queue wakes as soon
+as matching work is enqueued. The value is a connection lifetime, not a poll
+sleep. Android starts the next claim immediately after result submission and
+does not expose an inbound port. Reeves MCP results include additive timestamps
+for MCP receipt, queueing, claim, Android execution, result receipt, and MCP
+return so pickup, execution, upload, and serialization costs remain visible.
 
 ## Trusted routing boundary
 
@@ -45,15 +64,15 @@ Never commit or log either secret. Configure Reeves Android with key ID
 
 ## Deployment
 
-No production deployment is performed by this change. Using the repository's
-existing reversible Hostinger workflow:
+Use the repository's existing reversible Hostinger workflow:
 
 1. Add the two `BIOTELE_RELAY_REEVES_AGENT_*` variables in hPanel.
 2. Deploy the tested Git commit through Hostinger's Git integration.
 3. Restart the Node.js application whose startup command is
    `npm run start:hostinger-relay`.
 4. Verify `https://mcp.biotele.mx/readyz` returns ready.
-5. Start Reeves and verify `reeves_status`, then `reeves_screenshot`.
+5. Start Reeves and verify `reeves_status`, `reeves_sequence`, then
+   `reeves_screenshot`.
 6. Explicitly approve a low-risk device-changing tool call and confirm that the
    Windows agent remains able to execute a `codex_status` job.
 

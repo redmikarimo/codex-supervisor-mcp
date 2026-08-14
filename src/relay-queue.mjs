@@ -45,6 +45,7 @@ export class RelayQueue {
     arguments: args,
     requestId = randomUUID(),
     resultTimeoutMs = undefined,
+    mcpReceivedAt = undefined,
   }) {
     this.#reap();
     if (this.jobs.size >= this.maxQueuedJobs) {
@@ -52,6 +53,9 @@ export class RelayQueue {
     }
 
     const now = this.now();
+    if (mcpReceivedAt !== undefined && !Number.isSafeInteger(mcpReceivedAt)) {
+      throw new TypeError("mcpReceivedAt must be a safe integer when provided.");
+    }
     const completion = deferred();
     const job = {
       id: shortId(),
@@ -61,6 +65,9 @@ export class RelayQueue {
       arguments: args ?? {},
       state: "queued",
       createdAt: now,
+      queuedAt: now,
+      mcpReceivedAt,
+      claimedAt: undefined,
       expiresAt: now + this.jobTtlMs,
       resultDeadlineAt:
         Number.isSafeInteger(resultTimeoutMs) && resultTimeoutMs > 0
@@ -97,6 +104,7 @@ export class RelayQueue {
       job.leaseId = shortId();
       job.leaseOwner = leaseOwner;
       job.leasedUntil = now + this.leaseMs;
+      job.claimedAt = now;
       const resultBudgetMs = Math.max(
         0,
         Math.min(job.expiresAt, job.leasedUntil, job.resultDeadlineAt) - now,
@@ -112,6 +120,8 @@ export class RelayQueue {
         resultDeadlineAt: job.resultDeadlineAt ?? job.expiresAt,
         resultBudgetMs,
         deliveryCount: job.deliveryCount,
+        queuedAt: job.queuedAt,
+        claimedAt: job.claimedAt,
       };
     }
     return null;
@@ -158,12 +168,21 @@ export class RelayQueue {
 
   complete({ jobId, leaseId, leaseOwner = undefined, result = undefined, error = undefined }) {
     const job = this.assertCurrentLease({ jobId, leaseId, leaseOwner });
+    const resultReceivedAt = this.now();
+    const relayTiming = Number.isSafeInteger(job.mcpReceivedAt)
+      ? {
+          mcpReceivedAt: job.mcpReceivedAt,
+          queuedAt: job.queuedAt,
+          claimedAt: job.claimedAt,
+          resultReceivedAt,
+        }
+      : undefined;
 
     this.jobs.delete(jobId);
     if (error !== undefined) {
-      job.completion.resolve({ error });
+      job.completion.resolve({ error, ...(relayTiming ? { relayTiming } : {}) });
     } else {
-      job.completion.resolve({ result });
+      job.completion.resolve({ result, ...(relayTiming ? { relayTiming } : {}) });
     }
   }
 

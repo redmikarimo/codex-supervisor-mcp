@@ -138,6 +138,13 @@ result chunks keep each signed `/agent/jobs/result` request below
 `BIOTELE_RELAY_MAX_BODY_BYTES=262144`. No additional screenshot secret or
 public file storage is required.
 
+`BIOTELE_RELAY_AGENT_POLL_MS=25000` is the maximum lifetime of a routed long
+poll. Enqueue wakes a matching claim immediately, so reducing this value does
+not improve normal command pickup latency and would add connection churn.
+`reeves_sequence` instead removes repeated MCP round trips by executing a
+bounded batch locally and returning one final screenshot by default. Its result
+includes secret-free per-stage timestamps for production latency analysis.
+
 Do not set `BIOTELE_RELAY_CLIENT_KEYS` for ChatGPT. The public MCP endpoint
 uses OAuth bearer access tokens only. Agent HMAC credentials are separate and
 valid only on `/agent/jobs/claim`, `/agent/jobs/result`, and `/agent/status`.

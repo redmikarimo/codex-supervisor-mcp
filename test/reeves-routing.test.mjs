@@ -124,6 +124,7 @@ test("Reeves schemas are strict and correctly annotated", () => {
       "reeves_back",
       "reeves_home",
       "reeves_recents",
+      "reeves_sequence",
       "reeves_screenshot",
     ],
   );
@@ -137,6 +138,16 @@ test("Reeves schemas are strict and correctly annotated", () => {
   for (const tool of REEVES_TOOL_DEFINITIONS.slice(1, -1)) {
     assert.equal(tool.annotations.readOnlyHint, false);
     assert.equal(tool.annotations.destructiveHint, true);
+  }
+  const sequence = REEVES_TOOL_DEFINITIONS.find((tool) => tool.name === "reeves_sequence");
+  assert.equal(sequence.inputSchema.properties.actions.minItems, 1);
+  assert.equal(sequence.inputSchema.properties.actions.maxItems, 50);
+  assert.equal(sequence.inputSchema.properties.actions.items.oneOf.length, 8);
+  assert.equal(sequence.inputSchema.properties.screenshotAfter.default, true);
+  for (const actionSchema of sequence.inputSchema.properties.actions.items.oneOf) {
+    assert.equal(actionSchema.type, "object");
+    assert.equal(actionSchema.additionalProperties, false);
+    assert.ok(actionSchema.required.includes("type"));
   }
   assert.ok(TOOL_DEFINITIONS.every((tool) => tool.name.startsWith("codex_")));
 });
@@ -237,6 +248,7 @@ test("hosted tools/list exposes Codex and Reeves while Reeves calls route only t
   assert.ok(names.includes("codex_status"));
   assert.ok(names.includes("reeves_status"));
   assert.ok(names.includes("reeves_screenshot"));
+  assert.ok(names.includes("reeves_sequence"));
 
   const callPromise = mcpPost(baseUrl, token, {
     jsonrpc: "2.0",
@@ -265,6 +277,9 @@ test("hosted tools/list exposes Codex and Reeves while Reeves calls route only t
   const { job } = await reevesClaimResponse.json();
   assert.equal(job.toolName, "reeves_tap");
   assert.deepEqual(job.arguments, { x: 40, y: 80 });
+  assert.ok(Number.isSafeInteger(job.queuedAt));
+  assert.ok(Number.isSafeInteger(job.claimedAt));
+  assert.ok(job.claimedAt >= job.queuedAt);
 
   const wrongResult = await agentPost(
     baseUrl,
@@ -283,7 +298,24 @@ test("hosted tools/list exposes Codex and Reeves while Reeves calls route only t
     { jobId: job.id, leaseId: job.leaseId, result: { ok: true } },
   );
   assert.equal(rightResult.status, 202);
-  assert.equal((await callPromise).status, 200);
+  const callResponse = await callPromise;
+  assert.equal(callResponse.status, 200);
+  const relayTiming = (await callResponse.json()).result.structuredContent.timing.relay;
+  for (const key of [
+    "mcpReceivedAt",
+    "queuedAt",
+    "claimedAt",
+    "resultReceivedAt",
+    "mcpReturnedAt",
+    "requestToQueueMs",
+    "queueToClaimMs",
+    "claimToResultMs",
+    "resultToMcpReturnMs",
+    "totalServerMs",
+  ]) {
+    assert.ok(Number.isSafeInteger(relayTiming[key]), key);
+  }
+  assert.ok(relayTiming.totalServerMs >= 0);
 });
 
 test("split Windows and Reeves environment credentials authenticate independently", async (t) => {
@@ -323,6 +355,18 @@ test("Reeves status is read-scoped and device actions require write scope", asyn
     params: { name: "reeves_tap", arguments: { x: 1, y: 2 } },
   }, sessionId);
   assert.equal((await denied.json()).error.data.requiredScope, WRITE_SCOPE);
+  assert.equal(queue.size, 0);
+
+  const sequenceDenied = await mcpPost(baseUrl, "read-only", {
+    jsonrpc: "2.0",
+    id: "sequence-denied",
+    method: "tools/call",
+    params: {
+      name: "reeves_sequence",
+      arguments: { actions: [{ type: "home" }] },
+    },
+  }, sessionId);
+  assert.equal((await sequenceDenied.json()).error.data.requiredScope, WRITE_SCOPE);
   assert.equal(queue.size, 0);
 
   const statusCall = mcpPost(baseUrl, "read-only", {

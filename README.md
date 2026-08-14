@@ -258,7 +258,7 @@ Hostinger relay never starts Codex and never reads local repositories.
 
 The hosted relay keeps all existing `codex_*` tools and additionally exposes
 `reeves_status`, `reeves_tap`, `reeves_swipe`, `reeves_type`, `reeves_back`,
-`reeves_home`, `reeves_recents`, and `reeves_screenshot`. The local STDIO Codex
+`reeves_home`, `reeves_recents`, `reeves_sequence`, and `reeves_screenshot`. The local STDIO Codex
 registry remains Codex-only. Agent claims are filtered by authenticated key ID;
 client-supplied routing fields are ignored.
 
@@ -267,6 +267,15 @@ block (`image/png` with base64 data) together with width, height, capture
 timestamp, agent id, and byte-length metadata. The Android agent uses the
 relay-advertised chunked result protocol, so no unusable Android-local path is
 exposed and each signed HTTP request remains within the relay body limit.
+
+`reeves_sequence` sends 1 through 50 ordered device actions in one routed job.
+Android executes tap, swipe, type, Back, Home, Recents, wait, and screenshot
+actions locally, stops on the first error by default, and returns one final MCP
+image by default. Results include indexed action outcomes and additive,
+secret-free relay/Android stage timings. The existing 25-second agent request
+is a wake-on-enqueue long poll, not a pickup delay; Android immediately starts
+another claim after each successful result submission and reuses one OkHttp
+connection pool.
 
 This release also negotiates a supported MCP protocol version, issues a bounded
 OAuth-subject-bound session, and requires that session on follow-up requests.

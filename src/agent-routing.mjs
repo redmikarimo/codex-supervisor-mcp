@@ -31,6 +31,71 @@ const deviceActionAnnotations = annotations({
   openWorldHint: true,
 });
 
+const coordinate = (description) => ({
+  type: "integer",
+  minimum: 0,
+  description,
+});
+
+const gestureDuration = (defaultValue) => ({
+  type: "integer",
+  minimum: 1,
+  maximum: 10_000,
+  default: defaultValue,
+  description: "Gesture duration in milliseconds.",
+});
+
+const sequenceActionSchemas = [
+  {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      type: { const: "tap" },
+      x: coordinate("Horizontal screen coordinate in pixels."),
+      y: coordinate("Vertical screen coordinate in pixels."),
+      durationMs: gestureDuration(60),
+    },
+    required: ["type", "x", "y"],
+  },
+  {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      type: { const: "swipe" },
+      startX: coordinate("Starting horizontal pixel coordinate."),
+      startY: coordinate("Starting vertical pixel coordinate."),
+      endX: coordinate("Ending horizontal pixel coordinate."),
+      endY: coordinate("Ending vertical pixel coordinate."),
+      durationMs: gestureDuration(350),
+    },
+    required: ["type", "startX", "startY", "endX", "endY"],
+  },
+  {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      type: { const: "type" },
+      text: { type: "string", minLength: 1, maxLength: 16_384 },
+    },
+    required: ["type", "text"],
+  },
+  ...["back", "home", "recents", "screenshot"].map((type) => ({
+    type: "object",
+    additionalProperties: false,
+    properties: { type: { const: type } },
+    required: ["type"],
+  })),
+  {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      type: { const: "wait" },
+      ms: { type: "integer", minimum: 1, maximum: 10_000 },
+    },
+    required: ["type", "ms"],
+  },
+];
+
 export const REEVES_TOOL_DEFINITIONS = Object.freeze([
   {
     name: "reeves_status",
@@ -71,7 +136,7 @@ export const REEVES_TOOL_DEFINITIONS = Object.freeze([
           type: "integer",
           minimum: 1,
           maximum: 10_000,
-          default: 300,
+          default: 350,
           description: "Gesture duration in milliseconds.",
         },
       },
@@ -117,6 +182,42 @@ export const REEVES_TOOL_DEFINITIONS = Object.freeze([
     title: "Open Android Recents",
     description: "Invoke the Android Recents global action on the Reeves device.",
     inputSchema: emptyInputSchema,
+    annotations: deviceActionAnnotations,
+  },
+  {
+    name: "reeves_sequence",
+    title: "Run Android action sequence",
+    description:
+      "Execute an ordered batch of Android actions locally in one relay round trip, returning indexed results and one final screenshot by default.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        actions: {
+          type: "array",
+          minItems: 1,
+          maxItems: 50,
+          items: { oneOf: sequenceActionSchemas },
+          description: "Ordered actions to execute locally on the Reeves Android device.",
+        },
+        screenshotBefore: { type: "boolean", default: false },
+        screenshotAfter: { type: "boolean", default: true },
+        stopOnError: { type: "boolean", default: true },
+        perActionTimeoutMs: {
+          type: "integer",
+          minimum: 100,
+          maximum: 30_000,
+          default: 5_000,
+        },
+        overallTimeoutMs: {
+          type: "integer",
+          minimum: 1_000,
+          maximum: 120_000,
+          default: 60_000,
+        },
+      },
+      required: ["actions"],
+    },
     annotations: deviceActionAnnotations,
   },
   {
