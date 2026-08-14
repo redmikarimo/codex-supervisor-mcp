@@ -708,6 +708,36 @@ function sanitizedError(error) {
   };
 }
 
+function agentLogField(value, fallback = "unknown") {
+  const sanitized = sanitizeErrorText(value ?? fallback, 160)
+    .replace(/[\u0000-\u0020\u007f]+/g, "_")
+    .replace(/[^A-Za-z0-9_.:/-]/g, "_");
+  return sanitized || fallback;
+}
+
+function observeAgentRequest({ req, res, url, requestId, logger, errorLogger }) {
+  if (!url.pathname.startsWith("/agent/")) {
+    return null;
+  }
+  const context = {
+    keyId: "unverified",
+    rejectionReason: "",
+  };
+  res.once("finish", () => {
+    const status = res.statusCode;
+    const sink = status >= 400 ? errorLogger : logger;
+    const reason = context.rejectionReason
+      ? ` reason=${agentLogField(context.rejectionReason)}`
+      : "";
+    sink.write?.(
+      `Hostinger relay agent request: requestId=${agentLogField(requestId)} ` +
+        `method=${agentLogField(req.method)} path=${agentLogField(url.pathname)} ` +
+        `status=${status} agent=${agentLogField(context.keyId)}${reason}\n`,
+    );
+  });
+  return context;
+}
+
 export function createHostingerRelayServer({
   env = process.env,
   logger = process.stdout,
@@ -745,6 +775,14 @@ export function createHostingerRelayServer({
 
     try {
       const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+      const agentLog = observeAgentRequest({
+        req,
+        res,
+        url,
+        requestId,
+        logger,
+        errorLogger,
+      });
 
       if (url.pathname === "/healthz") {
         json(res, 200, {
@@ -877,6 +915,9 @@ export function createHostingerRelayServer({
           if (isAgentResult) {
             config.agentAuthFailureLimiter.record(preAuthAddress);
           }
+          if (agentLog) {
+            agentLog.rejectionReason = error?.message ?? error;
+          }
           json(res, 401, {
             error: "unauthorized",
             message: sanitizeErrorText(error?.message ?? error),
@@ -889,6 +930,9 @@ export function createHostingerRelayServer({
         if (!agentRateLimiter.accept(`agent:${auth.keyId}`)) {
           json(res, 429, { error: "rate_limit_exceeded" });
           return;
+        }
+        if (agentLog) {
+          agentLog.keyId = auth.keyId;
         }
         monitor.recordAgentSeen();
         await handleAgent({ req, res, url, parsed, config, monitor, auth });

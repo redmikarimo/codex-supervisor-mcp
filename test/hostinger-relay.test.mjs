@@ -923,6 +923,42 @@ test("relay accepts agent HMAC credentials on agent status route", async (t) => 
   assert.ok(payload.resultSubmission.chunkBytes <= 32 * 1024);
 });
 
+test("relay logs bounded agent request outcomes without secrets", async (t) => {
+  const output = [];
+  const errors = [];
+  const { server, baseUrl } = await withRawRelay(t, {
+    env: validEnv(),
+    logger: { write: (line) => output.push(line) },
+    errorLogger: { write: (line) => errors.push(line) },
+  });
+  await server.initialize();
+
+  const accepted = await agentSignedPost(baseUrl, "/agent/status", {});
+  assert.equal(accepted.status, 200);
+
+  const rejected = await agentSignedPost(
+    baseUrl,
+    "/agent/jobs/claim",
+    { maxWaitMs: 0, secret: AGENT_SECRET },
+    { secret: `${AGENT_SECRET}-wrong` },
+    { "x-request-id": "android request id" },
+  );
+  assert.equal(rejected.status, 401);
+  assert.deepEqual(await rejected.json(), {
+    error: "unauthorized",
+    message: "Invalid request signature.",
+  });
+
+  const acceptedLog = output.find((line) => line.includes("path=/agent/status"));
+  assert.match(acceptedLog, /method=POST .*status=200 agent=windows-agent-1/);
+
+  const rejectedLog = errors.find((line) => line.includes("path=/agent/jobs/claim"));
+  assert.match(rejectedLog, /status=401 agent=unverified reason=Invalid_request_signature\./);
+  assert.doesNotMatch(output.join(""), new RegExp(AGENT_SECRET));
+  assert.doesNotMatch(errors.join(""), new RegExp(AGENT_SECRET));
+  assert.match(rejectedLog, /requestId=android_request_id/);
+});
+
 test("chunk result traffic has a separate authenticated rate budget", async (t) => {
   const { server, baseUrl } = await withRawRelay(t, {
     env: validEnv(),
