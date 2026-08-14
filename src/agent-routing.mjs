@@ -122,7 +122,8 @@ export const REEVES_TOOL_DEFINITIONS = Object.freeze([
   {
     name: "reeves_screenshot",
     title: "Capture Android screenshot",
-    description: "Capture the current Reeves Android display without changing device state.",
+    description:
+      "Capture the current Reeves Android display and return its pixels as an MCP image content block with dimensions and capture metadata, without changing device state.",
     inputSchema: emptyInputSchema,
     annotations: readOnlyAnnotations,
   },

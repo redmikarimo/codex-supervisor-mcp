@@ -18,6 +18,8 @@ import {
 
 const AGENT_KEY_ID = "windows-agent-1";
 const AGENT_SECRET = "agent-secret-0123456789-0123456789";
+const REEVES_AGENT_KEY_ID = "reeves-android-1";
+const REEVES_AGENT_SECRET = "reeves-agent-secret-0123456789-012345";
 const BASE64_AGENT_SECRET = Buffer.alloc(48, 0x5a).toString("base64");
 const AUDIENCE = "https://mcp.biotele.mx/mcp";
 const READ_SCOPE = "biotele.mcp.read";
@@ -117,11 +119,12 @@ async function withRelay(t, {
   queue = new RelayQueue(),
   issuer,
   env = process.env,
+  agentCredentials = new Map([[AGENT_KEY_ID, AGENT_SECRET]]),
 } = {}) {
   const server = createHostingerRelayServer({
     env,
     queue,
-    agentCredentials: new Map([[AGENT_KEY_ID, AGENT_SECRET]]),
+    agentCredentials,
     publicUrl: "https://mcp.biotele.mx",
     logger: { write() {} },
     oauthResourceServer: new OAuthResourceServer({
@@ -1554,6 +1557,91 @@ test("relay result submission completes a pending MCP read tool call through a m
   assert.equal(mcpResponse.status, 200);
   const payload = await mcpResponse.json();
   assert.deepEqual(payload.result, toolResult);
+});
+
+test("chunked Reeves screenshot reaches MCP as an image content block", async (t) => {
+  const key = createRsaKey("kid-1");
+  const idp = await withIdentityProvider(t, { keys: [key] });
+  const baseUrl = await withRelay(t, {
+    issuer: idp.issuer,
+    agentCredentials: new Map([
+      [AGENT_KEY_ID, AGENT_SECRET],
+      [REEVES_AGENT_KEY_ID, REEVES_AGENT_SECRET],
+    ]),
+  });
+  const token = mintJwt({ issuer: idp.issuer, key, scope: READ_SCOPE });
+  const sessionId = await initializeMcpSession(baseUrl, token);
+  const mcpCall = oauthPost(
+    baseUrl,
+    "/mcp",
+    {
+      jsonrpc: "2.0",
+      id: "reeves-image-result",
+      method: "tools/call",
+      params: { name: "reeves_screenshot", arguments: {} },
+    },
+    token,
+    { "mcp-session-id": sessionId },
+  );
+
+  const claimResponse = await agentSignedPost(
+    baseUrl,
+    "/agent/jobs/claim",
+    { maxWaitMs: 100 },
+    { keyId: REEVES_AGENT_KEY_ID, secret: REEVES_AGENT_SECRET },
+  );
+  assert.equal(claimResponse.status, 200);
+  const claim = await claimResponse.json();
+  assert.equal(claim.job.toolName, "reeves_screenshot");
+  assert.equal(claim.resultSubmission.preferredProtocol, RESULT_SUBMISSION_PROTOCOL);
+
+  const pngBase64 =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+  const metadata = {
+    ok: true,
+    width: 1,
+    height: 1,
+    mimeType: "image/png",
+    timestamp: 1_787_000_000_000,
+    agentId: REEVES_AGENT_KEY_ID,
+    byteLength: Buffer.from(pngBase64, "base64").length,
+  };
+  const toolResult = {
+    content: [
+      { type: "image", mimeType: "image/png", data: pngBase64 },
+      { type: "text", text: JSON.stringify(metadata) },
+    ],
+    structuredContent: metadata,
+    isError: false,
+  };
+  const encoded = encodeResultSubmission(
+    { result: toolResult },
+    {
+      maxResultBytes: claim.resultSubmission.maxResultBytes,
+      chunkBytes: claim.resultSubmission.chunkBytes,
+      maxChunks: claim.resultSubmission.maxChunks,
+      uploadId: "upload-reeves-image-result",
+    },
+  );
+  for (const submission of encoded.submissions) {
+    const response = await agentSignedPost(
+      baseUrl,
+      "/agent/jobs/result",
+      { jobId: claim.job.id, leaseId: claim.job.leaseId, submission },
+      { keyId: REEVES_AGENT_KEY_ID, secret: REEVES_AGENT_SECRET },
+    );
+    assert.equal(response.status, 202);
+  }
+
+  const response = await mcpCall;
+  assert.equal(response.status, 200);
+  const payload = await response.json();
+  assert.deepEqual(payload.result, toolResult);
+  assert.equal(payload.result.content[0].type, "image");
+  assert.equal(payload.result.content[0].mimeType, "image/png");
+  assert.equal(payload.result.content[0].data, pngBase64);
+  assert.equal("path" in payload.result.structuredContent, false);
+  assert.equal("data" in payload.result.structuredContent, false);
 });
 
 test("legacy result submissions obey the configured result limit and payload shape", async (t) => {
