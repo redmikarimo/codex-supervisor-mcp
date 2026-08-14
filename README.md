@@ -262,6 +262,12 @@ The hosted relay keeps all existing `codex_*` tools and additionally exposes
 registry remains Codex-only. Agent claims are filtered by authenticated key ID;
 client-supplied routing fields are ignored.
 
+`reeves_screenshot` returns Android pixels as a standard MCP `image` content
+block (`image/png` with base64 data) together with width, height, capture
+timestamp, agent id, and byte-length metadata. The Android agent uses the
+relay-advertised chunked result protocol, so no unusable Android-local path is
+exposed and each signed HTTP request remains within the relay body limit.
+
 This release also negotiates a supported MCP protocol version, issues a bounded
 OAuth-subject-bound session, and requires that session on follow-up requests.
 Retried tool calls are bound to the OAuth subject, MCP session, typed JSON-RPC

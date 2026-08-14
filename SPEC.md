@@ -81,6 +81,12 @@ The current pain is uncertainty: a configured plugin may appear connected while 
     individual full turn remains the unavoidable native materialization unit.
     Event trimming preserves the newest suffix and uses logarithmic envelope
     measurements rather than repeatedly serializing after every removed event.
+12. `reeves_screenshot` returns the current Android display as an MCP image
+    content block, not an Android-local path. Compact structured metadata
+    includes width, height, MIME type, capture timestamp, and authenticated
+    agent id. Android uses the relay-advertised chunked result protocol, and
+    bounds/downscales PNG output so the complete MCP result remains below
+    1,500,000 UTF-8 bytes.
 
 ## UX Flows
 
@@ -97,6 +103,13 @@ Inspect and control disposable work:
 2. Inspect the exact command or file-change request before resolving it.
 3. Accept, decline, cancel, or interrupt only as authorized.
 4. Verify the terminal thread state, empty approval queue, and absence of unintended changes.
+
+Inspect and operate the Reeves Android display:
+
+1. Call `reeves_screenshot` and visually inspect the returned MCP image.
+2. Derive absolute coordinates from the returned dimensions.
+3. Call a harmless `reeves_tap` or `reeves_swipe` action.
+4. Call `reeves_screenshot` again and visually confirm the expected change.
 
 ## Tools and API Design
 
@@ -127,6 +140,10 @@ This is a tool-only conversational app; its outputs are compact structured data 
   exactly at the reported transcript position.
 - `codex_list_approvals`: return inspectable pending command and file-change requests.
 - `codex_resolve_approval`: accept, accept for the session, decline, or cancel a supported inspected request.
+- `reeves_screenshot`: return an MCP `image` content block with standard base64
+  PNG data. `structuredContent` contains only compact capture metadata and
+  never a sandbox path or duplicate image payload. Android submits the result
+  through the relay-advertised chunked HMAC result protocol.
 
 Remote action calls are idempotent within an OAuth-subject-bound MCP session.
 The relay negotiates a supported protocol, requires the issued session on

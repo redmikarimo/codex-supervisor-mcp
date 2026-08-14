@@ -102,6 +102,8 @@ NODE_ENV=production
 PORT=<provided by Hostinger, or 3000 if hPanel asks for one>
 BIOTELE_RELAY_AGENT_KEY_ID=windows-agent-1
 BIOTELE_RELAY_AGENT_SECRET=<different 32+ byte agent secret>
+BIOTELE_RELAY_REEVES_AGENT_KEY_ID=reeves-android-1
+BIOTELE_RELAY_REEVES_AGENT_SECRET=<different 32+ byte Reeves agent secret>
 BIOTELE_RELAY_PUBLIC_URL=https://mcp.biotele.mx
 BIOTELE_RELAY_TRUST_PROXY=true
 BIOTELE_RELAY_OAUTH_REQUIRED=true
@@ -130,6 +132,14 @@ BIOTELE_RELAY_MONITOR_AGENT_STALE_MS=120000
 BIOTELE_RELAY_MONITOR_WEBHOOK_URL=<optional HTTPS alert webhook URL>
 BIOTELE_RELAY_MONITOR_WEBHOOK_TIMEOUT_MS=10000
 ```
+
+The Reeves Android agent uses the authenticated `base64url-json-chunked-v1`
+result protocol advertised by `/agent/status` and `/agent/jobs/claim` for
+screenshots. Keep `BIOTELE_RELAY_MAX_RESULT_BYTES=2097152`; Android bounds the
+PNG and complete MCP result below 1,500,000 bytes, while the relay's 32 KiB
+result chunks keep each signed `/agent/jobs/result` request below
+`BIOTELE_RELAY_MAX_BODY_BYTES=262144`. No additional screenshot secret or
+public file storage is required.
 
 `BIOTELE_RELAY_IDEMPOTENCY_MAX_BYTES` bounds retained settled tool outcomes. It
 must be at least `BIOTELE_RELAY_MAX_RESULT_BYTES` and must reserve 512 bytes for
